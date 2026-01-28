@@ -374,34 +374,88 @@ def settle_common_pairwise_by_value(pay_set, receive_set, totals, neutralize) ->
 def settle_not_ready_extra_penalties(players, not_ready_set, receive_set, common_v, fyw, fyr, fyt, fbw, fbr, fbt, ey,
                                      eb) -> List[Transfer]:
     transfers = []
-    v_map = {"幺鸡": int(common_v.get("幺鸡", 0)), "八筒": int(common_v.get("八筒", 0))}
-    f_info = {"幺鸡": (fyw, fyr, fyt), "八筒": (fbw, fbr, fbt)}
-    e_map = {"幺鸡": ey, "八筒": eb}
+    return transfers
 
-    for p in players:
-        if p not in not_ready_set: continue
-        recvs = [r for r in receive_set if r != p]
-        if not recvs: continue
 
-        for cname in ["幺鸡", "八筒"]:
-            who, res, tar = f_info[cname]
-            v = v_map[cname]
-            if v <= 0 or who != p: continue
-            if res in ["被碰", "被明杠", "被胡"]:
-                if tar:
-                    targets = tar if isinstance(tar, list) else [tar]
-                    for t in targets:
-                        if t and t in receive_set and t != p:
-                            add_transfer(transfers, t, p, 2 * v, f"未听牌-责任鸡赔付-{cname}(×2)")
-            elif res == "安全":
-                for r in recvs:
-                    add_transfer(transfers, r, p, 2 * v, f"🏁 未听牌-冲锋鸡赔付-{cname}(×2)")
+# 新规则实现：未听牌包赔其听牌时本应获得的鸡分（通过翻转应得转账实现）
+def settle_not_ready_baopay_would_gain(
+    *,
+    players: List[str],
+    not_ready_set: Set[str],
+    pay_set: Set[str],
+    receive_set_actual: Set[str],
+    fan_card: str,
+    hand_total_counts: Dict[str, int],
+    fan_unit: int,
+    common_v: Dict[str, int],
+    first_yj_who: str, first_yj_res: str, first_yj_tar,
+    first_b8_who: str, first_b8_res: str, first_b8_tar,
+    extra_yj: Dict[str, int],
+    extra_b8: Dict[str, int],
+    gang_data: List[Dict],
+) -> List[Transfer]:
+    """未听牌包赔（按你最新口径）：
 
-        for cname in ["幺鸡", "八筒"]:
-            v = v_map[cname]
-            cnt = int(e_map[cname].get(p, 0))
-            if v > 0 and cnt > 0:
-                for r in recvs: add_transfer(transfers, r, p, cnt * v, f"为听牌打出常鸡赔付-{cname}")
+    规则：未听牌者不参与“鸡分收益侧”，但如果其在“听牌状态”下本应获得某些鸡分（翻鸡/冲锋鸡/常鸡互斥/责任鸡），
+    则改为：未听牌者向原本会支付这些鸡分给他的人，反向支付同额（即：把“本该收到的转账”翻转为“本该支付的转账”）。
+
+    这样可严格实现：未听牌者赔付其听牌时本该获得的鸡分（而不是任意向所有人均摊）。
+    """
+
+    transfers: List[Transfer] = []
+    if not not_ready_set:
+        return transfers
+
+    # 假设：未听牌者在“听牌/有效”集合中（receive_set_hypo）
+    receive_set_hypo = set(receive_set_actual) | set(not_ready_set)
+
+    # 1) 翻鸡：按互斥规则计算“若其可收分时，本应收到的转账”，然后翻转
+    hypo_fan = settle_fan_chicken_pairwise(
+        pay_set,
+        receive_set_hypo,
+        {p: int(hand_total_counts.get(p, 0)) for p in players},
+        unit=int(fan_unit),
+    )
+    for tr in hypo_fan:
+        if tr.receiver in not_ready_set and tr.payer in pay_set:
+            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(翻鸡应得翻转): {tr.reason}")
+
+    # 2) 责任鸡（首出被碰/被明杠/被胡）：若未听牌者在听牌时本应获得责任鸡，也需要翻转为其支付
+    hypo_resp = []
+    hypo_resp += settle_common_first_responsibility(
+        pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who, first_yj_res, first_yj_tar
+    )
+    hypo_resp += settle_common_first_responsibility(
+        pay_set, receive_set_hypo, common_v, "八筒", first_b8_who, first_b8_res, first_b8_tar
+    )
+    for tr in hypo_resp:
+        if tr.receiver in not_ready_set and tr.payer in pay_set:
+            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(责任鸡应得翻转): {tr.reason}")
+
+    # 3) 冲锋鸡互斥：若未听牌者在听牌时本应从互斥中获得转账，则翻转为其支付
+    hypo_charge = []
+    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who, first_yj_res)
+    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "八筒", first_b8_who, first_b8_res)
+    for tr in hypo_charge:
+        if tr.receiver in not_ready_set and tr.payer in pay_set:
+            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(冲锋鸡应得翻转): {tr.reason}")
+
+    # 4) 常鸡互斥（含手牌/碰/杠池）：计算“若未听牌者可收分时，本应收到的转账”，并翻转
+    totals_hypo, neutralize_hypo = build_common_pool_values_and_neutralize(
+        players,
+        pay_set,
+        receive_set_hypo,
+        common_v,
+        first_yj_who, first_yj_res, first_yj_tar,
+        first_b8_who, first_b8_res, first_b8_tar,
+        extra_yj, extra_b8,
+        gang_data,
+    )
+    hypo_common = settle_common_pairwise_by_value(pay_set, receive_set_hypo, totals_hypo, neutralize_hypo)
+    for tr in hypo_common:
+        if tr.receiver in not_ready_set and tr.payer in pay_set:
+            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(常鸡应得翻转): {tr.reason}")
+
     return transfers
 
 
@@ -572,6 +626,23 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
                                                                              first_b8_who, first_b8_res, first_b8_tar,
                                                                              extra_yj, extra_b8, gang_data)
     transfers += settle_common_pairwise_by_value(pay_set, receive_set, common_pool_totals, neutralize)
+
+    # ✅ 未听牌包赔（按最新口径）：赔付其在“听牌状态”下本该获得的鸡分（通过翻转应得转账实现）
+    transfers += settle_not_ready_baopay_would_gain(
+        players=players,
+        not_ready_set=not_ready_set,
+        pay_set=pay_set,
+        receive_set_actual=receive_set,
+        fan_card=fan_card,
+        hand_total_counts={p: int(hand_total_counts.get(p, 0)) for p in players},
+        fan_unit=int(fan_unit),
+        common_v=common_v,
+        first_yj_who=first_yj_who, first_yj_res=first_yj_res, first_yj_tar=first_yj_tar,
+        first_b8_who=first_b8_who, first_b8_res=first_b8_res, first_b8_tar=first_b8_tar,
+        extra_yj=extra_yj,
+        extra_b8=extra_b8,
+        gang_data=gang_data,
+    )
 
     scores = {p: 0 for p in players}
     details = {p: [] for p in players}
@@ -1554,7 +1625,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-

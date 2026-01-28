@@ -224,6 +224,7 @@ def settle_gang_base_points(gang_data, eligible_set, burn_ready_player, not_read
     valid_receivers = set(eligible_set)
     if burn_ready_player: valid_receivers.discard(burn_ready_player)
 
+    players = list(valid_receivers | not_ready_set)
     for g in gang_data:
         doer, gtype, victim = g.get('doer'), g.get('type'), g.get('victim')
         if not doer: continue
@@ -231,8 +232,9 @@ def settle_gang_base_points(gang_data, eligible_set, burn_ready_player, not_read
 
         if doer in valid_receivers:
             if gtype == "暗杠":
-                for p in eligible_set:
-                    if p != doer: add_transfer(transfers, doer, p, base_g, "暗杠(基础分)")
+                for p in players:
+                    if p != doer:
+                        add_transfer(transfers, doer, p, base_g, "暗杠(基础分)")
             elif gtype in ["普通明杠", "责任明杠"]:
                 if victim and victim in eligible_set and victim != doer:
                     add_transfer(transfers, doer, victim, base_g, "明杠(基础分)")

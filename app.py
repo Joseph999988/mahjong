@@ -97,7 +97,7 @@ def _first_outcome_consumed(first_who: str, first_res: str) -> int:
 
 
 def _has_tile_gang(gang_data: List[Dict], tile_name: str) -> List[Dict]:
-    return [g for g in gang_data if g.get("card") == tile_name and g.get("type") in ["暗杠", "普通明杠", "责任明杠"]]
+    return [g for g in gang_data if g.get("card") == tile_name and g.get("type") in ["暗杠", "补杠", "普通明杠", "责任明杠"]]
 
 
 def _validate_common_tile_max4(
@@ -128,6 +128,28 @@ def _validate_common_tile_max4(
         extras_total += c
 
     tile_gangs = _has_tile_gang(gang_data, tile_name)
+
+    # ✅ 封死逻辑：若出现“补杠”，其必须是【首出=被碰】后的补杠，且补杠者=碰牌者(首出被谁)，并且该牌不允许再出现其他杠类型。
+    bu_gangs = [g for g in tile_gangs if g.get("type") == "补杠"]
+    if bu_gangs:
+        # 不允许重复登记补杠（同一张常鸡最多一次补杠）
+        if len(bu_gangs) != 1:
+            raise ValueError(f"{tile_name} 补杠记录重复：同一张常鸡最多只能补杠一次（当前={len(bu_gangs)}）。")
+
+        # 必须是首出被碰后补杠
+        if not (first_who and first_who != "无/未现" and first_res == "被碰"):
+            raise ValueError(f"{tile_name} 出现补杠时，首出结局必须为‘被碰’且首出者已填写。")
+        if not first_tar or first_tar == first_who:
+            raise ValueError(f"{tile_name} 被碰后补杠必须填写‘被谁?’（碰牌者），且不能等于首出者。")
+
+        bu = bu_gangs[0]
+        if bu.get("doer") != first_tar:
+            raise ValueError(f"{tile_name} 被碰后补杠的补杠者必须为碰牌者：应为 {first_tar}，当前={bu.get('doer')}。")
+
+        # 同一张常鸡不允许同时出现暗杠/普通明杠/责任明杠等其它杠型
+        other_gangs = [g for g in tile_gangs if g.get("type") in ["暗杠", "普通明杠", "责任明杠"]]
+        if other_gangs:
+            raise ValueError(f"{tile_name} 已登记补杠时，不允许再登记其他杠型（暗杠/明杠/责任明杠）。")
     consumed = _first_outcome_consumed(first_who, first_res)
 
     # 任何杠事件（含首出被明杠）=> extra 必须全为 0
@@ -228,13 +250,19 @@ def settle_gang_base_points(gang_data, eligible_set, burn_ready_player, not_read
     for g in gang_data:
         doer, gtype, victim = g.get('doer'), g.get('type'), g.get('victim')
         if not doer: continue
-        base_g = 4 if gtype == "暗杠" else 2
+        if gtype == "暗杠":
+            base_g = 4
+        elif gtype == "补杠":
+            base_g = 2
+        else:
+            base_g = 2
 
         if doer in valid_receivers:
-            if gtype == "暗杠":
+            if gtype in ["暗杠", "补杠"]:
+                reason = "暗杠(基础分)" if gtype == "暗杠" else "补杠(基础分)"
                 for p in players:
                     if p != doer:
-                        add_transfer(transfers, doer, p, base_g, "暗杠(基础分)")
+                        add_transfer(transfers, doer, p, base_g, reason)
             elif gtype in ["普通明杠", "责任明杠"]:
                 if victim and victim in eligible_set and victim != doer:
                     add_transfer(transfers, doer, victim, base_g, "明杠(基础分)")
@@ -243,8 +271,10 @@ def settle_gang_base_points(gang_data, eligible_set, burn_ready_player, not_read
             continue
 
         elif doer in not_ready_set:
-            if gtype == "暗杠":
-                for p in valid_receivers: add_transfer(transfers, p, doer, base_g, "未听牌-暗杠赔付")
+            if gtype in ["暗杠", "补杠"]:
+                reason = "未听牌-暗杠赔付" if gtype == "暗杠" else "未听牌-补杠赔付"
+                for p in valid_receivers:
+                    add_transfer(transfers, p, doer, base_g, reason)
             elif gtype in ["普通明杠", "责任明杠"]:
                 if victim and victim in valid_receivers and victim != doer:
                     add_transfer(transfers, victim, doer, base_g, "未听牌-明杠赔付")
@@ -311,8 +341,15 @@ def build_common_pool_values_and_neutralize(players, pay_set, receive_set, commo
 
     # B) Bumped
     def add_bump_pool(res, tar, cname):
+        # 若常鸡被碰后又补杠：以补杠(4张)为准，不再额外计入被碰(3张)，避免 3V + 4V 重复。
         if res == "被碰" and tar in receive_set and v_map[cname] > 0:
-            totals[tar] += 3 * v_map[cname]
+            has_bu_gang = False
+            for g in gang_data:
+                if g.get("type") == "补杠" and g.get("card") == cname and g.get("doer") == tar:
+                    has_bu_gang = True
+                    break
+            if not has_bu_gang:
+                totals[tar] += 3 * v_map[cname]
 
     add_bump_pool(fyr, fyt, "幺鸡")
     add_bump_pool(fbr, fbt, "八筒")
@@ -373,7 +410,39 @@ def settle_common_pairwise_by_value(pay_set, receive_set, totals, neutralize) ->
 
 def settle_not_ready_extra_penalties(players, not_ready_set, receive_set, common_v, fyw, fyr, fyt, fbw, fbr, fbt, ey,
                                      eb) -> List[Transfer]:
-    transfers = []
+    transfers: List[Transfer] = []
+
+    # ✅ 规则：未听牌者登记的“手牌常鸡”（非首出常鸡，ey/eb）需要触发反向赔付。
+    #    若玩家 p 未听牌，且其手牌常鸡合计价值为 S，则 p 向所有【听牌/胡牌有效(receive_set)】玩家各赔付 S。
+    #    例：p 有 2 张幺鸡，幺鸡价值=2，则 S=4；p 未听牌 => 向每个听牌/胡牌者各赔 4。
+
+    v_yj = int(common_v.get("幺鸡", 0))
+    v_b8 = int(common_v.get("八筒", 0))
+
+    for p in players:
+        if p not in not_ready_set:
+            continue
+
+        recvs = [r for r in receive_set if r != p]
+        if not recvs:
+            continue
+
+        # 幺鸡手牌常鸡
+        if v_yj > 0:
+            cnt_yj = int(ey.get(p, 0))
+            if cnt_yj > 0:
+                amt = cnt_yj * v_yj
+                for r in recvs:
+                    add_transfer(transfers, r, p, amt, f"未听牌-手牌常鸡反向赔付-幺鸡({cnt_yj}张)")
+
+        # 八筒手牌常鸡
+        if v_b8 > 0:
+            cnt_b8 = int(eb.get(p, 0))
+            if cnt_b8 > 0:
+                amt = cnt_b8 * v_b8
+                for r in recvs:
+                    add_transfer(transfers, r, p, amt, f"未听牌-手牌常鸡反向赔付-八筒({cnt_b8}张)")
+
     return transfers
 
 
@@ -409,16 +478,6 @@ def settle_not_ready_baopay_would_gain(
     # 假设：未听牌者在“听牌/有效”集合中（receive_set_hypo）
     receive_set_hypo = set(receive_set_actual) | set(not_ready_set)
 
-    # 1) 翻鸡：按互斥规则计算“若其可收分时，本应收到的转账”，然后翻转
-    hypo_fan = settle_fan_chicken_pairwise(
-        pay_set,
-        receive_set_hypo,
-        {p: int(hand_total_counts.get(p, 0)) for p in players},
-        unit=int(fan_unit),
-    )
-    for tr in hypo_fan:
-        if tr.receiver in not_ready_set and tr.payer in pay_set:
-            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(翻鸡应得翻转): {tr.reason}")
 
     # 2) 责任鸡（首出被碰/被明杠/被胡）：若未听牌者在听牌时本应获得责任鸡，也需要翻转为其支付
     hypo_resp = []
@@ -441,6 +500,13 @@ def settle_not_ready_baopay_would_gain(
             add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(冲锋鸡应得翻转): {tr.reason}")
 
     # 4) 常鸡互斥（含手牌/碰/杠池）：计算“若未听牌者可收分时，本应收到的转账”，并翻转
+    # ⚠️ 避免与 `settle_not_ready_extra_penalties` 对“未听牌-非首出常鸡(手牌常鸡 ey/eb)”的均摊反向赔付重复计费：
+    # 在“假设听牌”的常鸡互斥计算中，先将未听牌者的手牌常鸡数量视为 0，只保留其因碰/杠等导致的常鸡池贡献。
+    extra_yj_hypo = dict(extra_yj)
+    extra_b8_hypo = dict(extra_b8)
+    for p in not_ready_set:
+        extra_yj_hypo[p] = 0
+        extra_b8_hypo[p] = 0
     totals_hypo, neutralize_hypo = build_common_pool_values_and_neutralize(
         players,
         pay_set,
@@ -448,7 +514,7 @@ def settle_not_ready_baopay_would_gain(
         common_v,
         first_yj_who, first_yj_res, first_yj_tar,
         first_b8_who, first_b8_res, first_b8_tar,
-        extra_yj, extra_b8,
+        extra_yj_hypo, extra_b8_hypo,
         gang_data,
     )
     hypo_common = settle_common_pairwise_by_value(pay_set, receive_set_hypo, totals_hypo, neutralize_hypo)
@@ -533,7 +599,7 @@ def validate_winner_and_event_consistency(
     # (3) 被胡的牌，不允许再出现任何杠记录；反向同样成立
     def _has_any_gang(tile_name: str) -> bool:
         for g in gang_data:
-            if g.get("card") == tile_name and g.get("type") in ["暗杠", "普通明杠", "责任明杠"]:
+            if g.get("card") == tile_name and g.get("type") in ["暗杠", "补杠", "普通明杠", "责任明杠"]:
                 return True
         return False
 
@@ -1475,13 +1541,43 @@ def main():
                     gw = c_g1.selectbox("杠主", ["无"] + players, key=K(f"gw{i}"), label_visibility="collapsed",
                                         placeholder="杠主")
                     if gw != "无":
-                        gt = c_g2.selectbox("类型", ["暗杠", "普通明杠"], key=K(f"gt{i}"), label_visibility="collapsed")
-                        gc = c_g3.selectbox("牌种", ["杂牌", "幺鸡", "八筒"], key=K(f"gc{i}"), label_visibility="collapsed")
+                        gt = c_g2.selectbox("类型", ["暗杠", "补杠", "普通明杠"], key=K(f"gt{i}"), label_visibility="collapsed")
+                        if gt == "补杠":
+                            gc = c_g3.selectbox("牌种", ["杂牌"], key=K(f"gc{i}"), label_visibility="collapsed", disabled=True)
+                        else:
+                            gc = c_g3.selectbox("牌种", ["杂牌", "幺鸡", "八筒"], key=K(f"gc{i}"), label_visibility="collapsed")
                         gv = None
                         if gt == "普通明杠":
                             gv = c_g4.selectbox("被杠者", [p for p in players if p != gw], key=K(f"gv{i}"),
                                                 label_visibility="collapsed", placeholder="被杠者")
                         gang_data.append({'doer': gw, 'type': gt, 'card': gc, 'victim': gv})
+
+                # ✅ 常鸡“被碰后补杠”选项：补杠者自动为碰牌者（doer=被谁 fyt/fbt），并视为消耗第四张常鸡
+                if fyw != "无/未现" and fyr == "被碰" and fyt:
+                    yj_bu = st.checkbox(f"幺鸡被碰后补杠（补杠者：{fyt}）", value=False, key=K("yj_bu_gang"))
+                    if yj_bu:
+                        # 去重：同一张常鸡(幺鸡)同一补杠者只允许出现一次
+                        exists = False
+                        for g in gang_data:
+                            if g.get('type') == '补杠' and g.get('card') == '幺鸡' and g.get('doer') == fyt:
+                                exists = True
+                                break
+                        if not exists:
+                            gang_data.append({'doer': fyt, 'type': '补杠', 'card': '幺鸡', 'victim': None})
+                            st.caption(f"ℹ️ 自动添加: {fyt} 补杠 (幺鸡)")
+
+                if fbw != "无/未现" and fbr == "被碰" and fbt:
+                    b8_bu = st.checkbox(f"八筒被碰后补杠（补杠者：{fbt}）", value=False, key=K("b8_bu_gang"))
+                    if b8_bu:
+                        # 去重：同一张常鸡(八筒)同一补杠者只允许出现一次
+                        exists = False
+                        for g in gang_data:
+                            if g.get('type') == '补杠' and g.get('card') == '八筒' and g.get('doer') == fbt:
+                                exists = True
+                                break
+                        if not exists:
+                            gang_data.append({'doer': fbt, 'type': '补杠', 'card': '八筒', 'victim': None})
+                            st.caption(f"ℹ️ 自动添加: {fbt} 补杠 (八筒)")
 
                 if st.button("➕ 添加", key=K("add_gang")):
                     st.session_state.gang_rows += 1

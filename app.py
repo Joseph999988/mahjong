@@ -5,7 +5,7 @@ import os
 
 
 # ==============================================================================
-# 🧠 Logic Kernel (V24 - 剩余鸡分双轨制计分版)
+# 🧠 Logic Kernel (V25 - 碰牌剩余双轨制修复版)
 # ==============================================================================
 # -------------------------------
 # Reset helper
@@ -344,11 +344,11 @@ def settle_remaining_bump_kong_items(
         first_b8_who, first_b8_res, first_b8_tar
 ) -> List[Transfer]:
     """
-    3. 碰/杠剩余常鸡结算 (V24 最终修正版)
-    - 计分逻辑双轨制：
-        - 对于“责任人”(Victim)：算 3 张 (扣除责任鸡)。
-        - 对于“非责任人”(Bystanders)：算 4 张 (视为完整资产)。
-    - 结算对象：全场结算 (根据上述张数分别计算)。
+    3. 碰/杠剩余常鸡结算 (V25 最终修正版)
+    - 计分逻辑双轨制 (碰牌/杠牌 通用)：
+        - 对于“责任人”(Victim)：扣除1张 (碰算2张, 杠算3张)。
+        - 对于“非责任人”(Bystanders)：全额 (碰算3张, 杠算4张)。
+    - 结算对象：全场结算。
     """
     transfers = []
     v_yj = int(common_v.get("幺鸡", 0))
@@ -364,22 +364,29 @@ def settle_remaining_bump_kong_items(
                     has_bu = True
                     break
 
-            # 只有未升级为补杠时，才结算碰牌剩余(2张)
+            # 只有未升级为补杠时，才结算碰牌剩余
             if not has_bu:
                 owner = first_tar
-                count = 2
-                amt = count * val
+                victim = first_who
 
-                # 结算逻辑
-                if owner in receive_set_actual:
-                    # 赢：收全场
-                    for p in pay_set:
-                        if p != owner:
-                            add_transfer(transfers, owner, p, amt, f"🐔 碰牌剩余-{cname}(2张)")
-                elif owner in pay_set:
-                    # 输：赔听牌者
-                    for p in receive_set_actual:
-                        add_transfer(transfers, p, owner, amt, f"未听牌-赔付碰牌剩余-{cname}(2张)")
+                # 双轨制金额
+                amt_for_victim = 2 * val  # 3-1
+                amt_for_others = 3 * val  # 3
+
+                # 1. 针对责任人 (Victim)
+                if victim in pay_set:
+                    if owner in receive_set_actual:
+                        add_transfer(transfers, owner, victim, amt_for_victim, f"🐔 碰牌剩余-{cname}(2张)")
+                    elif owner in pay_set and victim in receive_set_actual:
+                        add_transfer(transfers, victim, owner, amt_for_victim, f"未听牌-赔付碰牌剩余-{cname}(2张)")
+
+                # 2. 针对其他人
+                bystanders = [p for p in pay_set if p != owner and p != victim]
+                for p in bystanders:
+                    if owner in receive_set_actual:
+                        add_transfer(transfers, owner, p, amt_for_others, f"🐔 碰牌剩余-{cname}(3张)")
+                    elif owner in pay_set and p in receive_set_actual:
+                        add_transfer(transfers, p, owner, amt_for_others, f"未听牌-赔付碰牌剩余-{cname}(3张)")
 
     def check_gang_remain(val):
         if val <= 0: return
@@ -392,19 +399,11 @@ def settle_remaining_bump_kong_items(
             if cname not in ["幺鸡", "八筒"]: continue
             if not owner: continue
 
-            # 1. 确定基本张数
-            # 默认为暗杠/补杠/普通明杠 = 4张
-            # 责任明杠 = 3张 (但这是针对Victim的，针对Others仍是4张)
-
-            # 2. 判断是否涉及“首出责任”以确定 Victim
+            # 1. 确定责任人 (real_victim)
             real_victim = None
-
-            # 情况A: 显式责任明杠
             if gtype == "责任明杠":
                 real_victim = victim
-
-            # 情况B: 责任碰后的补杠
-            if gtype == "补杠":
+            elif gtype == "补杠":
                 is_resp_origin = False
                 if cname == "幺鸡" and first_yj_who != "无/未现" and first_yj_res == "被碰" and first_yj_tar == owner:
                     is_resp_origin = True
@@ -413,33 +412,26 @@ def settle_remaining_bump_kong_items(
                     is_resp_origin = True
                     real_victim = first_b8_who
 
-            # 3. 计算金额
-            # 针对责任人：扣除1张 (算3张)
-            # 针对其他人：全额 (算4张)
+            # 2. 计算金额 (双轨制)
+            # 责任人: 3张; 路人: 4张
             amt_for_victim = 3 * int(common_v.get(cname, 0))
             amt_for_others = 4 * int(common_v.get(cname, 0))
 
-            # 4. 执行结算 (双轨制)
+            # 3. 执行结算
 
-            # 4.1 针对 责任人 (real_victim)
+            # 3.1 针对 责任人 (real_victim)
             if real_victim and real_victim in pay_set:
                 if owner in receive_set_actual:
-                    # 赢：收责任人 3 张
                     add_transfer(transfers, owner, real_victim, amt_for_victim, f"🐔 杠牌剩余-{cname}(3张)")
                 elif owner in pay_set and real_victim in receive_set_actual:
-                    # 输：赔责任人 3 张 (如果责任人听牌)
                     add_transfer(transfers, real_victim, owner, amt_for_victim, f"未听牌-赔付杠牌剩余-{cname}(3张)")
 
-            # 4.2 针对 其他人 (bystanders)
-            # 所有人排除 owner 和 real_victim
+            # 3.2 针对 其他人 (bystanders)
             bystanders = [p for p in pay_set if p != owner and p != real_victim]
-
             for p in bystanders:
                 if owner in receive_set_actual:
-                    # 赢：收路人 4 张
                     add_transfer(transfers, owner, p, amt_for_others, f"🐔 杠牌剩余-{cname}(4张)")
                 elif owner in pay_set and p in receive_set_actual:
-                    # 输：赔路人 4 张 (如果路人听牌)
                     add_transfer(transfers, p, owner, amt_for_others, f"未听牌-赔付杠牌剩余-{cname}(4张)")
 
     # 执行检测
@@ -456,7 +448,7 @@ def settle_not_ready_baopay_v20(
         first_b8_who, first_b8_res, first_b8_tar,
 ) -> List[Transfer]:
     """
-    V24 未听牌包赔 - 仅剩余项目（责任鸡 & 冲锋鸡）
+    V25 未听牌包赔 - 仅剩余项目（责任鸡 & 冲锋鸡）
     """
     transfers = []
     if not not_ready_set: return transfers
@@ -489,7 +481,7 @@ def settle_not_ready_baopay_v20(
 
 
 # -------------------------------
-# Main calculate (Aggregator) - V24
+# Main calculate (Aggregator) - V25
 # -------------------------------
 def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_events, rules_config, fan_card,
                   ready_list, first_yj_who, first_yj_res, first_yj_tar, first_b8_who, first_b8_res, first_b8_tar,
@@ -558,7 +550,7 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
     hand_totals = build_hand_chicken_totals(players, receive_set, common_v, extra_yj, extra_b8)
     transfers += settle_hand_chicken_pairwise(pay_set, receive_set, hand_totals)
 
-    # 6. 碰/杠 剩余常鸡 (双轨制计分) - 🚨 V24 核心修正
+    # 6. 碰/杠 剩余常鸡 (双轨制计分) - 🚨 V25 修复：碰牌也适用双轨制
     transfers += settle_remaining_bump_kong_items(
         players=players, pay_set=pay_set, receive_set_actual=receive_set, common_v=common_v, gang_data=gang_data,
         first_yj_who=first_yj_who, first_yj_res=first_yj_res, first_yj_tar=first_yj_tar,
@@ -588,11 +580,11 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
 
 
 # ==============================================================================
-# UI - V24 Ultimate Stable
+# UI - V25 Ultimate Stable
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="捉鸡Pro - V24", page_icon="🀄", layout="wide")
+    st.set_page_config(page_title="捉鸡Pro - V25", page_icon="🀄", layout="wide")
 
     main_round = int(st.session_state.get("main_round", 0))
     K = lambda s: f"main_{main_round}_{s}"

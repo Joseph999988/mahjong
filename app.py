@@ -5,7 +5,7 @@ import os
 
 
 # ==============================================================================
-# 🧠 Logic Kernel (v18 - 逻辑严密版)
+# 🧠 Logic Kernel (V19 - 严厉修正版：未听牌绝不收钱)
 # ==============================================================================
 # -------------------------------
 # Reset helper
@@ -109,14 +109,7 @@ def _validate_common_tile_max4(
     extra_map: Dict[str, int],
     gang_data: List[Dict],
 ):
-    """幺鸡/八筒客观约束：每种牌只有4张。
-
-    强约束（按你的口径）：
-    - 首出发生时：根据结局占用 1/3/4 张；剩余张数最多只允许体现在 extra_map（手牌常鸡）里。
-    - 发生任何形式的杠（暗杠/明杠/责任明杠）时：视为 4 张已被杠吃完，因此 extra_map 全场必须为 0。
-      （覆盖：幺鸡/八筒被杠时，其他人不会再有）
-    - 若首出为“被明杠”，也属于杠场景，同样要求 extra_map 全场为 0。
-    """
+    """幺鸡/八筒客观约束：每种牌只有4张。"""
 
     extras_total = 0
     for p in players:
@@ -129,14 +122,12 @@ def _validate_common_tile_max4(
 
     tile_gangs = _has_tile_gang(gang_data, tile_name)
 
-    # ✅ 封死逻辑：若出现“补杠”，其必须是【首出=被碰】后的补杠，且补杠者=碰牌者(首出被谁)，并且该牌不允许再出现其他杠类型。
+    # ✅ 封死逻辑：若出现“补杠”，其必须是【首出=被碰】后的补杠
     bu_gangs = [g for g in tile_gangs if g.get("type") == "补杠"]
     if bu_gangs:
-        # 不允许重复登记补杠（同一张常鸡最多一次补杠）
         if len(bu_gangs) != 1:
             raise ValueError(f"{tile_name} 补杠记录重复：同一张常鸡最多只能补杠一次（当前={len(bu_gangs)}）。")
 
-        # 必须是首出被碰后补杠
         if not (first_who and first_who != "无/未现" and first_res == "被碰"):
             raise ValueError(f"{tile_name} 出现补杠时，首出结局必须为‘被碰’且首出者已填写。")
         if not first_tar or first_tar == first_who:
@@ -146,7 +137,6 @@ def _validate_common_tile_max4(
         if bu.get("doer") != first_tar:
             raise ValueError(f"{tile_name} 被碰后补杠的补杠者必须为碰牌者：应为 {first_tar}，当前={bu.get('doer')}。")
 
-        # 同一张常鸡不允许同时出现暗杠/普通明杠/责任明杠等其它杠型
         other_gangs = [g for g in tile_gangs if g.get("type") in ["暗杠", "普通明杠", "责任明杠"]]
         if other_gangs:
             raise ValueError(f"{tile_name} 已登记补杠时，不允许再登记其他杠型（暗杠/明杠/责任明杠）。")
@@ -159,7 +149,6 @@ def _validate_common_tile_max4(
                 f"{tile_name} 出现‘杠’时（含被明杠/登记杠牌），不可能再有人持有：请把‘手牌常鸡-{tile_name}’全部设为0（当前合计={extras_total}）"
             )
 
-        # 首出被明杠时必须填写杠主，并且杠牌登记必须有匹配记录（防止输入自相矛盾）
         if first_who and first_who != "无/未现" and first_res == "被明杠":
             if not first_tar or first_tar == first_who:
                 raise ValueError(f"{tile_name} 首出为‘被明杠’时，必须填写‘被谁?’（杠主）。")
@@ -175,7 +164,7 @@ def _validate_common_tile_max4(
                 )
         return
 
-    # 无杠：按 4 张上限约束（首出占用 + 手牌 extra）
+    # 无杠：按 4 张上限约束
     if consumed == 0:
         if extras_total > 4:
             raise ValueError(f"{tile_name} 全场最多4张：当前手牌合计={extras_total}")
@@ -371,9 +360,6 @@ def build_common_pool_values_and_neutralize(players, pay_set, receive_set, commo
     for g in gang_data:
         if g.get('type') == '责任明杠':
             d, c, v = g.get('doer'), g.get('card'), g.get('victim')
-
-            # Avoid double-neutralize when UI auto-adds the same responsibility ming-gang
-            # that is already represented by the first-outcome (fbw/fbr/fbt or fyw/fyr/fyt).
             is_auto_same = False
             if c == "幺鸡" and fyw == v and fyr == "被明杠" and fyt == d:
                 is_auto_same = True
@@ -414,7 +400,6 @@ def settle_not_ready_extra_penalties(players, not_ready_set, receive_set, common
 
     # ✅ 规则：未听牌者登记的“手牌常鸡”（非首出常鸡，ey/eb）需要触发反向赔付。
     #    若玩家 p 未听牌，且其手牌常鸡合计价值为 S，则 p 向所有【听牌/胡牌有效(receive_set)】玩家各赔付 S。
-    #    例：p 有 2 张幺鸡，幺鸡价值=2，则 S=4；p 未听牌 => 向每个听牌/胡牌者各赔 4。
 
     v_yj = int(common_v.get("幺鸡", 0))
     v_b8 = int(common_v.get("八筒", 0))
@@ -446,29 +431,32 @@ def settle_not_ready_extra_penalties(players, not_ready_set, receive_set, common
     return transfers
 
 
-# 新规则实现：未听牌包赔其听牌时本应获得的鸡分（通过翻转应得转账实现）
+# ==============================================================================
+# 修正后的未听牌包赔逻辑 (V19.1)
+# ==============================================================================
 def settle_not_ready_baopay_would_gain(
-    *,
-    players: List[str],
-    not_ready_set: Set[str],
-    pay_set: Set[str],
-    receive_set_actual: Set[str],
-    fan_card: str,
-    hand_total_counts: Dict[str, int],
-    fan_unit: int,
-    common_v: Dict[str, int],
-    first_yj_who: str, first_yj_res: str, first_yj_tar,
-    first_b8_who: str, first_b8_res: str, first_b8_tar,
-    extra_yj: Dict[str, int],
-    extra_b8: Dict[str, int],
-    gang_data: List[Dict],
+        *,
+        players: List[str],
+        not_ready_set: Set[str],
+        pay_set: Set[str],
+        receive_set_actual: Set[str],
+        fan_card: str,
+        hand_total_counts: Dict[str, int],
+        fan_unit: int,
+        common_v: Dict[str, int],
+        first_yj_who: str, first_yj_res: str, first_yj_tar,
+        first_b8_who: str, first_b8_res: str, first_b8_tar,
+        extra_yj: Dict[str, int],
+        extra_b8: Dict[str, int],
+        gang_data: List[Dict],
 ) -> List[Transfer]:
-    """未听牌包赔（按你最新口径）：
+    """未听牌包赔（V19.1 绝对值修正版）：
 
-    规则：未听牌者不参与“鸡分收益侧”，但如果其在“听牌状态”下本应获得某些鸡分（翻鸡/冲锋鸡/常鸡互斥/责任鸡），
-    则改为：未听牌者向原本会支付这些鸡分给他的人，反向支付同额（即：把“本该收到的转账”翻转为“本该支付的转账”）。
-
-    这样可严格实现：未听牌者赔付其听牌时本该获得的鸡分（而不是任意向所有人均摊）。
+    规则：
+    1. 正常结算中，未听牌者已被视为0，因此已经赔付了听牌者的牌（A vs 0）。
+    2. 在此反向包赔环节，我们需要计算未听牌者“自身持有”的牌力，并全额罚款。
+    3. 关键修正：在比较时，强制将听牌者的牌力设为0。防止听牌者的牌“抵消”掉未听牌者的罚款。
+       (即：实现 B赔A(A的牌) + B赔A(B的牌) 的双重叠加，而不是 B赔A(B-A) )。
     """
 
     transfers: List[Transfer] = []
@@ -478,8 +466,7 @@ def settle_not_ready_baopay_would_gain(
     # 假设：未听牌者在“听牌/有效”集合中（receive_set_hypo）
     receive_set_hypo = set(receive_set_actual) | set(not_ready_set)
 
-
-    # 2) 责任鸡（首出被碰/被明杠/被胡）：若未听牌者在听牌时本应获得责任鸡，也需要翻转为其支付
+    # 2) 责任鸡（首出被碰/被明杠/被胡）：B本该赢的，反转为赔
     hypo_resp = []
     hypo_resp += settle_common_first_responsibility(
         pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who, first_yj_res, first_yj_tar
@@ -488,25 +475,28 @@ def settle_not_ready_baopay_would_gain(
         pay_set, receive_set_hypo, common_v, "八筒", first_b8_who, first_b8_res, first_b8_tar
     )
     for tr in hypo_resp:
-        if tr.receiver in not_ready_set and tr.payer in pay_set:
+        if tr.receiver in not_ready_set and tr.payer in receive_set_actual:
             add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(责任鸡应得翻转): {tr.reason}")
 
-    # 3) 冲锋鸡互斥：若未听牌者在听牌时本应从互斥中获得转账，则翻转为其支付
+    # 3) 冲锋鸡互斥：B本该赢的，反转为赔
     hypo_charge = []
-    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who, first_yj_res)
-    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "八筒", first_b8_who, first_b8_res)
+    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who,
+                                                  first_yj_res)
+    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "八筒", first_b8_who,
+                                                  first_b8_res)
     for tr in hypo_charge:
-        if tr.receiver in not_ready_set and tr.payer in pay_set:
+        if tr.receiver in not_ready_set and tr.payer in receive_set_actual:
             add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(冲锋鸡应得翻转): {tr.reason}")
 
-    # 4) 常鸡互斥（含手牌/碰/杠池）：计算“若未听牌者可收分时，本应收到的转账”，并翻转
-    # ⚠️ 避免与 `settle_not_ready_extra_penalties` 对“未听牌-非首出常鸡(手牌常鸡 ey/eb)”的均摊反向赔付重复计费：
-    # 在“假设听牌”的常鸡互斥计算中，先将未听牌者的手牌常鸡数量视为 0，只保留其因碰/杠等导致的常鸡池贡献。
+    # 4) 常鸡互斥（重点修正）：计算B的碰/杠/手牌价值，全额赔付给A
+
+    # 步骤A: 为了避免手牌常鸡重复计算（在settle_not_ready_extra_penalties已算过），先将未听牌者手牌设为0
     extra_yj_hypo = dict(extra_yj)
     extra_b8_hypo = dict(extra_b8)
     for p in not_ready_set:
         extra_yj_hypo[p] = 0
         extra_b8_hypo[p] = 0
+
     totals_hypo, neutralize_hypo = build_common_pool_values_and_neutralize(
         players,
         pay_set,
@@ -517,9 +507,20 @@ def settle_not_ready_baopay_would_gain(
         extra_yj_hypo, extra_b8_hypo,
         gang_data,
     )
+
+    # 🚨 关键修正：将所有【真听牌者】的totals设为0。
+    # 理由：真听牌者的牌，已经在主流程中让B赔过了(A vs 0)。
+    # 这里我们只计算B自己有多少牌(B vs 0)，并让B再次全额赔付。
+    # 如果不设为0，就会变成 (B - A)，导致A的牌抵消了B的罚款。
+    for p in receive_set_actual:
+        totals_hypo[p] = 0
+
     hypo_common = settle_common_pairwise_by_value(pay_set, receive_set_hypo, totals_hypo, neutralize_hypo)
+
     for tr in hypo_common:
-        if tr.receiver in not_ready_set and tr.payer in pay_set:
+        # 只有当 B(未听) 赢了 A(听牌) 时，才触发反转
+        # 由于我们将A设为了0，只要B有分，B就会“赢”A，从而触发这里的反转逻辑：B全额赔A。
+        if tr.receiver in not_ready_set and tr.payer in receive_set_actual:
             add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(常鸡应得翻转): {tr.reason}")
 
     return transfers
@@ -537,20 +538,11 @@ def validate_winner_and_event_consistency(
     first_b8_who: str, first_b8_res: str, first_b8_tar,
     gang_data: List[Dict],
 ):
-    """一致性约束（不改口径，只禁止自相矛盾输入）：
-
-    必修清单：
-    1) 被胡对象必须属于胡牌者 winners
-    2) 幺鸡/八筒不可同时被胡
-    3) 被胡的常鸡牌不允许再出现任何杠记录（反向同样成立）
-    4) 被胡/被碰/被明杠 => 必须首出（首出者不能为 无/未现）
-
-    额外：支持点炮一炮多响时，被胡目标为 winners 列表。
-    """
+    """一致性约束（不改口径，只禁止自相矛盾输入）。"""
 
     winners_set = set([w for w in winners if w in players])
 
-    # 自摸：不存在“首出常鸡被胡”（胡牌张非打出）
+    # 自摸：不存在“首出常鸡被胡”
     if method == "自摸":
         if first_yj_res == "被胡" or first_b8_res == "被胡":
             raise ValueError("自摸成立时，不存在‘首出常鸡被胡’：请将幺鸡/八筒结局从‘被胡’改为‘安全/被碰/被明杠’。")
@@ -558,19 +550,14 @@ def validate_winner_and_event_consistency(
     def _is_hu(res: str) -> bool:
         return res == "被胡"
 
-    # (2) mutual exclusion: cannot both be hu
     if _is_hu(first_yj_res) and _is_hu(first_b8_res):
         raise ValueError("幺鸡与八筒不可能同时被胡：请只保留其中一个为‘被胡’。")
 
-    # helper: normalize tar to list
     def _tar_list(tar):
-        if tar is None:
-            return []
-        if isinstance(tar, list):
-            return [t for t in tar if t]
+        if tar is None: return []
+        if isinstance(tar, list): return [t for t in tar if t]
         return [tar]
 
-    # (4) must have first out if res implies interaction
     def _require_first_out(tile_name: str, who: str, res: str):
         if res in ["被碰", "被明杠", "被胡"]:
             if not who or who == "无/未现":
@@ -579,15 +566,11 @@ def validate_winner_and_event_consistency(
     _require_first_out("幺鸡", first_yj_who, first_yj_res)
     _require_first_out("八筒", first_b8_who, first_b8_res)
 
-    # (1) 被胡对象必须属于 winners；并支持一炮多响时为 winners 列表
     def _validate_hu_target(tile_name: str, res: str, tar):
-        if res != "被胡":
-            return
+        if res != "被胡": return
         if not winners_set:
             raise ValueError(f"已选择 {tile_name} ‘被胡’，但胡牌者为空：请先选择胡牌者。")
-
         tl = _tar_list(tar)
-        # Require that target set equals winners_set (auto-inherit policy)
         if set(tl) != winners_set:
             raise ValueError(
                 f"{tile_name} ‘被胡’必须继承胡牌者名单：当前={tl if tl else '空'}，应为={sorted(list(winners_set))}。"
@@ -596,7 +579,6 @@ def validate_winner_and_event_consistency(
     _validate_hu_target("幺鸡", first_yj_res, first_yj_tar)
     _validate_hu_target("八筒", first_b8_res, first_b8_tar)
 
-    # (3) 被胡的牌，不允许再出现任何杠记录；反向同样成立
     def _has_any_gang(tile_name: str) -> bool:
         for g in gang_data:
             if g.get("card") == tile_name and g.get("type") in ["暗杠", "补杠", "普通明杠", "责任明杠"]:
@@ -607,7 +589,6 @@ def validate_winner_and_event_consistency(
         raise ValueError("幺鸡已设置为‘被胡’，但杠牌登记里仍存在幺鸡的杠：同一张牌不可能既被胡又被杠。")
     if _is_hu(first_b8_res) and _has_any_gang("八筒"):
         raise ValueError("八筒已设置为‘被胡’，但杠牌登记里仍存在八筒的杠：同一张牌不可能既被胡又被杠。")
-
     if _has_any_gang("幺鸡") and _is_hu(first_yj_res):
         raise ValueError("幺鸡存在杠记录时，不允许将幺鸡首出结局设置为‘被胡’。")
     if _has_any_gang("八筒") and _is_hu(first_b8_res):
@@ -625,14 +606,12 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
     burn_trigger = (method == "点炮") and (("热炮" in special_events) or ("抢杠胡" in special_events))
     burn_player = loser if burn_trigger else None
 
-    # [FIXED HERE] Explicitly define burn_player_is_ready BEFORE using it
     burn_player_is_ready = False
     if burn_player and (burn_player in ready_set):
         burn_player_is_ready = True
 
     not_ready_set = set([p for p in players if p not in eligible_set])
 
-    # 客观事实约束：每种牌只有4张（翻鸡/幺鸡/八筒）
     validate_objective_facts(
         players=players,
         fan_card=fan_card,
@@ -644,7 +623,6 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
         gang_data=gang_data,
     )
 
-    # 逻辑一致性约束：被胡目标/互斥/与杠冲突
     validate_winner_and_event_consistency(
         players=players,
         winners=winners,
@@ -654,7 +632,6 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
         gang_data=gang_data,
     )
 
-    # Now this usage is safe
     burn_ready_player = burn_player if (burn_trigger and burn_player and burn_player_is_ready) else None
 
     receive_set = set(eligible_set)
@@ -693,7 +670,8 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
                                                                              extra_yj, extra_b8, gang_data)
     transfers += settle_common_pairwise_by_value(pay_set, receive_set, common_pool_totals, neutralize)
 
-    # ✅ 未听牌包赔（按最新口径）：赔付其在“听牌状态”下本该获得的鸡分（通过翻转应得转账实现）
+    # ✅ 未听牌包赔（V19）：赔付其在“听牌状态”下本该获得的鸡分（通过翻转应得转账实现）
+    # 修正：receive_set_actual=receive_set 确保只对真听牌者反向赔付
     transfers += settle_not_ready_baopay_would_gain(
         players=players,
         not_ready_set=not_ready_set,
@@ -722,11 +700,11 @@ def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_ev
 
 
 # ==============================================================================
-# UI - V18 Ultimate Stable (No Animation, Fixed Logic)
+# UI - V19 Ultimate Stable (No Animation, Fixed Logic)
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="捉鸡Pro - V18", page_icon="🀄", layout="wide")
+    st.set_page_config(page_title="捉鸡Pro - V19", page_icon="🀄", layout="wide")
 
     main_round = int(st.session_state.get("main_round", 0))
     K = lambda s: f"main_{main_round}_{s}"

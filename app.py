@@ -381,7 +381,7 @@ def main():
         .block-container { padding-top: 2rem; padding-bottom: 3rem; }
         .sticky-panel { position: sticky; top: 14px; z-index: 5; }
         .action-bar { background: rgba(18,22,32,0.85); border: 1px solid rgba(255,255,255,0.14); border-radius: 20px; padding: 12px; backdrop-filter: blur(20px); margin-bottom: 14px; }
-        #MainMenu {visibility: hidden;} header {visibility: hidden;} footer {visibility: hidden;}
+        # footer {visibility: hidden;}
         </style>
     """, unsafe_allow_html=True)
 

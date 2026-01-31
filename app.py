@@ -1,6 +1,9 @@
 import streamlit as st
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
+from datetime import datetime
+import csv
+import io
 import os
 
 
@@ -58,6 +61,47 @@ class Transaction:
             reason=f"未听牌包赔-{self.reason}",
             category=self.category
         )
+
+
+@dataclass
+class LedgerEntry:
+    round_no: int
+    payer: str
+    receiver: str
+    amount: int
+    note: str
+    source: str
+    created_at: str
+
+
+def append_ledger_entry(entry: LedgerEntry) -> None:
+    ledger_entries = st.session_state.setdefault("ledger_entries", [])
+    ledger_entries.append(entry)
+
+
+def ledger_entries_to_rows(entries: List[LedgerEntry]) -> List[Dict[str, str]]:
+    return [
+        {
+            "回合": entry.round_no,
+            "付款人": entry.payer,
+            "收款人": entry.receiver,
+            "金额": entry.amount,
+            "备注": entry.note,
+            "来源": entry.source,
+            "时间": entry.created_at,
+        }
+        for entry in entries
+    ]
+
+
+def build_ledger_csv(rows: List[Dict[str, str]]) -> str:
+    buffer = io.StringIO()
+    fieldnames = ["回合", "付款人", "收款人", "金额", "备注", "来源", "时间"]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue()
 
 
 def build_common_chicken_cfg(base_yj: int, mul_yj: int, base_b8: int, mul_b8: int, fan_card) -> Dict[str, int]:
@@ -500,6 +544,8 @@ def main():
 
     if "gang_rows" not in st.session_state:
         st.session_state.gang_rows = 1
+    if "ledger_entries" not in st.session_state:
+        st.session_state.ledger_entries = []
 
     # ---------------- Sidebar ----------------
     with st.sidebar:
@@ -909,6 +955,7 @@ def main():
 
                 i, j = 0, 0
                 tx_html = ""
+                settlement_transfers = []
                 while i < len(debt) and j < len(cred):
                     dn, da = debt[i];
                     cn, ca = cred[j]
@@ -920,6 +967,7 @@ def main():
                             </div>
                             <div class="tx-amt-box">¥ {int(amt)}</div>
                         </div>"""
+                        settlement_transfers.append((dn, cn, int(amt)))
                     debt[i][1] -= amt;
                     cred[j][1] -= amt
                     if debt[i][1] < 0.1: i += 1
@@ -944,6 +992,87 @@ def main():
                             elif ": +" in line:
                                 color = "green"
                             st.markdown(f"- :{color}[{line}]")
+
+            ledger_settle_key = K("settle_logged")
+            if settlement_transfers and not st.session_state.get(ledger_settle_key):
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                for payer, receiver, amount in settlement_transfers:
+                    append_ledger_entry(LedgerEntry(
+                        round_no=main_round + 1,
+                        payer=payer,
+                        receiver=receiver,
+                        amount=amount,
+                        note="本局自动结算",
+                        source="自动",
+                        created_at=now,
+                    ))
+                st.session_state[ledger_settle_key] = True
+
+        with st.container(border=True):
+            ui_section("记账本", icon="📒")
+            st.caption("记录本局外的往来或自动结算结果，支持手动补录与导出。")
+
+            entry_cols = st.columns([1.2, 1.2, 0.9, 1.7])
+            with entry_cols[0]:
+                ledger_payer = st.selectbox("付款人", ["请选择"] + players, key=K("ledger_payer"))
+            with entry_cols[1]:
+                ledger_receiver = st.selectbox("收款人", ["请选择"] + players, key=K("ledger_receiver"))
+            with entry_cols[2]:
+                ledger_amount = st.number_input("金额", min_value=0, value=0, step=1, key=K("ledger_amount"))
+            with entry_cols[3]:
+                ledger_note = st.text_input("备注", key=K("ledger_note"), placeholder="例如：线下补差、代付等")
+
+            action_cols = st.columns([1, 1, 2])
+            with action_cols[0]:
+                add_ledger = st.button("➕ 添加记账", key=K("ledger_add_btn"))
+            with action_cols[1]:
+                clear_ledger = st.button("🧹 清空账本", key=K("ledger_clear_btn"))
+
+            if add_ledger:
+                if ledger_payer == "请选择" or ledger_receiver == "请选择":
+                    st.error("请完整选择付款人和收款人。")
+                elif ledger_payer == ledger_receiver:
+                    st.error("付款人和收款人不能相同。")
+                elif ledger_amount <= 0:
+                    st.error("请输入大于 0 的金额。")
+                else:
+                    append_ledger_entry(LedgerEntry(
+                        round_no=main_round + 1,
+                        payer=ledger_payer,
+                        receiver=ledger_receiver,
+                        amount=int(ledger_amount),
+                        note=ledger_note or "手动记账",
+                        source="手动",
+                        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ))
+                    st.success("已添加到记账本。")
+
+            if clear_ledger:
+                st.session_state.ledger_entries = []
+                st.success("已清空记账本。")
+
+            ledger_rows = ledger_entries_to_rows(st.session_state.ledger_entries)
+            if ledger_rows:
+                totals = {p: 0 for p in players}
+                for row in ledger_rows:
+                    totals[row["收款人"]] += int(row["金额"])
+                    totals[row["付款人"]] -= int(row["金额"])
+
+                totals_cols = st.columns(len(players))
+                for idx, p in enumerate(players):
+                    totals_cols[idx].metric(f"{p} 合计", totals[p])
+
+                st.dataframe(ledger_rows, use_container_width=True, hide_index=True)
+                csv_data = build_ledger_csv(ledger_rows)
+                st.download_button(
+                    label="⬇️ 下载账本 CSV",
+                    data=csv_data,
+                    file_name="mahjong_ledger.csv",
+                    mime="text/csv",
+                    key=K("ledger_download"),
+                )
+            else:
+                st.info("记账本暂无记录。")
 
 
 if __name__ == "__main__":

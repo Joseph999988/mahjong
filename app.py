@@ -5,12 +5,14 @@ import os
 
 
 # ==============================================================================
-# 🧠 Logic Kernel (V25 - 碰牌剩余双轨制修复版)
+# 🧠 Logic Kernel (V36 - 极简录入版: 独立广播模型)
 # ==============================================================================
+
 # -------------------------------
 # Reset helper
 # -------------------------------
 def reset_main_ui_state():
+    """重置核心UI状态，保留玩家名字"""
     st.session_state["main_round"] = int(st.session_state.get("main_round", 0)) + 1
     st.session_state["gang_rows"] = 1
 
@@ -40,16 +42,22 @@ def get_fan_multipliers(fan_card: str) -> Tuple[int, int]:
 
 
 @dataclass
-class Transfer:
-    receiver: str;
-    payer: str;
-    amount: int;
+class Transaction:
+    payer: str
+    receiver: str
+    amount: int
     reason: str
+    category: str  # 'hu', 'gang', 'chicken_resp', 'chicken_charge', 'chicken_extra'
 
-
-def add_transfer(transfers: List[Transfer], receiver: str, payer: str, amount: int, reason: str):
-    if receiver == payer or amount <= 0: return
-    transfers.append(Transfer(receiver=receiver, payer=payer, amount=int(amount), reason=reason))
+    def reverse(self):
+        """反转交易（用于未听牌包赔）"""
+        return Transaction(
+            payer=self.receiver,
+            receiver=self.payer,
+            amount=self.amount,
+            reason=f"未听牌包赔-{self.reason}",
+            category=self.category
+        )
 
 
 def build_common_chicken_cfg(base_yj: int, mul_yj: int, base_b8: int, mul_b8: int, fan_card) -> Dict[str, int]:
@@ -70,6 +78,7 @@ def _first_outcome_consumed(first_who: str, first_res: str) -> int:
     if not first_who or first_who == "无/未现": return 0
     if first_res == "被碰": return 3
     if first_res == "被明杠": return 4
+    if first_res == "被胡": return 1
     return 1
 
 
@@ -79,7 +88,9 @@ def _has_tile_gang(gang_data: List[Dict], tile_name: str) -> List[Dict]:
 
 
 def _validate_common_tile_max4(tile_name, players, first_who, first_res, first_tar, extra_map, gang_data):
+    # 计算非首出总数
     extras_total = sum(int(extra_map.get(p, 0)) for p in players)
+
     tile_gangs = _has_tile_gang(gang_data, tile_name)
 
     bu_gangs = [g for g in tile_gangs if g.get("type") == "补杠"]
@@ -94,11 +105,12 @@ def _validate_common_tile_max4(tile_name, players, first_who, first_res, first_t
             raise ValueError(f"{tile_name} 已登记补杠时，不允许再登记其他杠型。")
 
     consumed = _first_outcome_consumed(first_who, first_res)
+
+    # 如果有杠，或者被明杠，其余常鸡必须为0
     if tile_gangs or (first_who and first_who != "无/未现" and first_res == "被明杠"):
         if extras_total != 0:
-            raise ValueError(f"{tile_name} 出现杠时，手牌常鸡必须全为0。")
+            raise ValueError(f"{tile_name} 出现杠时，非首出常鸡必须全为0。")
 
-        # 验证被明杠的一致性
         if first_who and first_who != "无/未现" and first_res == "被明杠":
             if not first_tar or first_tar == first_who:
                 raise ValueError(f"{tile_name} 首出为‘被明杠’时，必须填写‘被谁?’（杠主）。")
@@ -118,16 +130,16 @@ def _validate_common_tile_max4(tile_name, players, first_who, first_res, first_t
         if extras_total > 1:
             raise ValueError(f"{tile_name} 被碰后全场剩余最多1张。")
     else:
-        # 安全/被胡
         if consumed > 0 and extras_total > 3:
             raise ValueError(f"{tile_name} 打出后全场剩余最多3张。")
 
     if consumed + extras_total > 4:
-        raise ValueError(f"{tile_name} 总数超限：首出占用={consumed}, 手牌合计={extras_total}。")
+        raise ValueError(f"{tile_name} 总数超限：首出占用={consumed}, 其余合计={extras_total}。")
 
 
 def validate_objective_facts(*, players, fan_card, hand_total_counts, first_yj_who, first_yj_res, first_yj_tar,
-                             first_b8_who, first_b8_res, first_b8_tar, extra_yj, extra_b8, gang_data):
+                             first_b8_who, first_b8_res, first_b8_tar,
+                             extra_yj, extra_b8, gang_data):
     _validate_fan_counts_max4(players, fan_card, hand_total_counts)
     _validate_common_tile_max4("幺鸡", players, first_yj_who, first_yj_res, first_yj_tar, extra_yj, gang_data)
     _validate_common_tile_max4("八筒", players, first_b8_who, first_b8_res, first_b8_tar, extra_b8, gang_data)
@@ -190,406 +202,289 @@ def validate_winner_and_event_consistency(
 
 
 # -------------------------------
-# Logic: Settlement Functions
+# Main calculate (Aggregator) - V36
 # -------------------------------
-
-def settle_hu(players, winners, method, loser, hu_shape, is_qing, special_events, rules_config) -> List[Transfer]:
-    transfers = []
-    if not winners: return transfers
-    base = int(rules_config.get(hu_shape, 0)) + (int(rules_config.get("清一色加成", 0)) if is_qing else 0)
-    spec = sum(int(rules_config.get(e, 0)) for e in special_events)
-    total = base + spec
-    desc = f"{hu_shape}{'+清' if is_qing else ''}{'+' + '+'.join(special_events) if special_events else ''}"
-    if method == "自摸":
-        w = winners[0]
-        for p in players:
-            if p != w: add_transfer(transfers, w, p, total, f"自摸({desc})")
-    else:
-        if loser:
-            for w in winners: add_transfer(transfers, w, loser, total, f"点炮({desc})")
-    return transfers
-
-
-def settle_fan_chicken_pairwise(pay_set, receive_set, hand_counts, unit=1) -> List[Transfer]:
-    transfers = []
-    el = sorted(list(pay_set))
-    eff = lambda p: int(hand_counts.get(p, 0)) if p in receive_set else 0
-    for i in range(len(el)):
-        for j in range(i + 1, len(el)):
-            a, b = el[i], el[j]
-            ca, cb = eff(a), eff(b)
-            if ca == cb: continue
-            if ca > cb:
-                if a in receive_set: add_transfer(transfers, a, b, (ca - cb) * unit, "🖐️ 翻鸡")
-            elif cb > ca:
-                if b in receive_set: add_transfer(transfers, b, a, (cb - ca) * unit, "🖐️ 翻鸡")
-    return transfers
-
-
-def settle_gang_base_points(gang_data, eligible_set, burn_ready_player, not_ready_set) -> List[Transfer]:
-    """
-    4. 杠牌基础分 (Action Score)
-    规则：
-    - 暗杠(4)/补杠(2)：全场结算（听牌收钱，未听赔钱）。
-    - 明杠(2)：仅杠主与被杠人结算（听牌收钱，未听赔钱）。
-    """
-    transfers = []
-    valid_receivers = set(eligible_set)
-    if burn_ready_player: valid_receivers.discard(burn_ready_player)
-
-    # 支付者包含所有未赢的人（含未听牌）
-    players = list(valid_receivers | not_ready_set)
-
-    for g in gang_data:
-        doer, gtype, victim = g.get('doer'), g.get('type'), g.get('victim')
-        if not doer: continue
-        base_g = 4 if gtype == "暗杠" else 2
-
-        # A) 杠主听牌：收取分值
-        if doer in valid_receivers:
-            if gtype in ["暗杠", "补杠"]:
-                # 全场支付
-                for p in players:
-                    if p != doer:
-                        add_transfer(transfers, doer, p, base_g, f"{gtype}(基础分)")
-            elif gtype in ["普通明杠", "责任明杠"]:
-                # 仅被杠人支付
-                if victim and victim in players and victim != doer:
-                    add_transfer(transfers, doer, victim, base_g, "明杠(基础分)")
-
-        # B) 杠主未听牌：反向赔付
-        elif doer in not_ready_set:
-            if gtype in ["暗杠", "补杠"]:
-                # 赔给所有听牌者
-                for p in valid_receivers:
-                    add_transfer(transfers, p, doer, base_g, f"未听牌-{gtype}赔付")
-            elif gtype in ["普通明杠", "责任明杠"]:
-                # 仅赔给听牌的被杠人
-                if victim and victim in valid_receivers and victim != doer:
-                    add_transfer(transfers, victim, doer, base_g, "未听牌-明杠赔付")
-
-    return transfers
-
-
-def settle_common_first_responsibility(pay_set, receive_set, common_v, card_name, who, res, tar) -> List[Transfer]:
-    """责任鸡结算 (1张，2倍赔付，仅限打出者 who 赔付)"""
-    transfers = []
-    if not (who and who != "无/未现"): return transfers
-    if res not in ["被碰", "被明杠", "被胡"] or not tar: return transfers
-    v = int(common_v.get(card_name, 0))
-    if v <= 0: return transfers
-
-    targets = tar if isinstance(tar, list) else [tar]
-    for t in targets:
-        if not t: continue
-        # 正常逻辑：收者听牌，付者在场，且支付者是打牌者(who)
-        if t in receive_set and who in pay_set and t != who:
-            add_transfer(transfers, t, who, 2 * v, f"🔥 责任鸡赔付-{card_name}({res},×2)")
-
-    return transfers
-
-
-def settle_charge_chicken_pairwise(pay_set, receive_set, common_v, card, who, res) -> List[Transfer]:
-    """冲锋鸡结算"""
-    transfers = []
-    v = int(common_v.get(card, 0))
-    if v <= 0: return transfers
-    has_charge = {p: 0 for p in pay_set}
-    if who and who != "无/未现" and res == "安全" and who in receive_set: has_charge[who] = 1
-
-    el = sorted(list(pay_set))
-    for i in range(len(el)):
-        for j in range(i + 1, len(el)):
-            a, b = el[i], el[j]
-            va = has_charge.get(a, 0) * 2 * v
-            vb = has_charge.get(b, 0) * 2 * v
-            if va > vb and a in receive_set:
-                add_transfer(transfers, a, b, va - vb, f"🏁 冲锋鸡互斥-{card}")
-            elif vb > va and b in receive_set:
-                add_transfer(transfers, b, a, vb - va, f"🏁 冲锋鸡互斥-{card}")
-    return transfers
-
-
-def build_hand_chicken_totals(players, receive_set, common_v, ey, eb):
-    """手牌常鸡统计 (V21: 仅计算手牌)"""
-    totals = {p: 0 for p in players}
-    v_map = {"幺鸡": int(common_v.get("幺鸡", 0)), "八筒": int(common_v.get("八筒", 0))}
-    for cname, emap in [("幺鸡", ey), ("八筒", eb)]:
-        if v_map[cname] > 0:
-            for p in players:
-                # 只有听牌者才拥有有效的手牌常鸡计数
-                if p in receive_set:
-                    totals[p] += int(emap.get(p, 0)) * v_map[cname]
-    return totals
-
-
-def settle_hand_chicken_pairwise(pay_set, receive_set, totals) -> List[Transfer]:
-    """手牌常鸡互斥结算"""
-    transfers = []
-    el = sorted(list(pay_set))
-    for i in range(len(el)):
-        for j in range(i + 1, len(el)):
-            a, b = el[i], el[j]
-            val_a, val_b = totals.get(a, 0), totals.get(b, 0)
-            if val_a > val_b and a in receive_set:
-                add_transfer(transfers, a, b, val_a - val_b, "🐔 手牌常鸡互斥")
-            elif val_b > val_a and b in receive_set:
-                add_transfer(transfers, b, a, val_b - val_a, "🐔 手牌常鸡互斥")
-    return transfers
-
-
-def settle_remaining_bump_kong_items(
-        *, players, pay_set, receive_set_actual, common_v, gang_data,
-        first_yj_who, first_yj_res, first_yj_tar,
-        first_b8_who, first_b8_res, first_b8_tar
-) -> List[Transfer]:
-    """
-    3. 碰/杠剩余常鸡结算 (V25 最终修正版)
-    - 计分逻辑双轨制 (碰牌/杠牌 通用)：
-        - 对于“责任人”(Victim)：扣除1张 (碰算2张, 杠算3张)。
-        - 对于“非责任人”(Bystanders)：全额 (碰算3张, 杠算4张)。
-    - 结算对象：全场结算。
-    """
-    transfers = []
-    v_yj = int(common_v.get("幺鸡", 0))
-    v_b8 = int(common_v.get("八筒", 0))
-
-    # ---------------- 辅助函数：生成剩余项目 ----------------
-    def check_bump_remain(cname, first_who, first_res, first_tar, val):
-        if val <= 0: return
-        if first_who != "无/未现" and first_res == "被碰" and first_tar:
-            has_bu = False
-            for g in gang_data:
-                if g.get("card") == cname and g.get("type") == "补杠" and g.get("doer") == first_tar:
-                    has_bu = True
-                    break
-
-            # 只有未升级为补杠时，才结算碰牌剩余
-            if not has_bu:
-                owner = first_tar
-                victim = first_who
-
-                # 双轨制金额
-                amt_for_victim = 2 * val  # 3-1
-                amt_for_others = 3 * val  # 3
-
-                # 1. 针对责任人 (Victim)
-                if victim in pay_set:
-                    if owner in receive_set_actual:
-                        add_transfer(transfers, owner, victim, amt_for_victim, f"🐔 碰牌剩余-{cname}(2张)")
-                    elif owner in pay_set and victim in receive_set_actual:
-                        add_transfer(transfers, victim, owner, amt_for_victim, f"未听牌-赔付碰牌剩余-{cname}(2张)")
-
-                # 2. 针对其他人
-                bystanders = [p for p in pay_set if p != owner and p != victim]
-                for p in bystanders:
-                    if owner in receive_set_actual:
-                        add_transfer(transfers, owner, p, amt_for_others, f"🐔 碰牌剩余-{cname}(3张)")
-                    elif owner in pay_set and p in receive_set_actual:
-                        add_transfer(transfers, p, owner, amt_for_others, f"未听牌-赔付碰牌剩余-{cname}(3张)")
-
-    def check_gang_remain(val):
-        if val <= 0: return
-        for g in gang_data:
-            cname = g.get("card")
-            gtype = g.get("type")
-            owner = g.get("doer")
-            victim = g.get("victim")  # 责任人（若有）
-
-            if cname not in ["幺鸡", "八筒"]: continue
-            if not owner: continue
-
-            # 1. 确定责任人 (real_victim)
-            real_victim = None
-            if gtype == "责任明杠":
-                real_victim = victim
-            elif gtype == "补杠":
-                is_resp_origin = False
-                if cname == "幺鸡" and first_yj_who != "无/未现" and first_yj_res == "被碰" and first_yj_tar == owner:
-                    is_resp_origin = True
-                    real_victim = first_yj_who
-                elif cname == "八筒" and first_b8_who != "无/未现" and first_b8_res == "被碰" and first_b8_tar == owner:
-                    is_resp_origin = True
-                    real_victim = first_b8_who
-
-            # 2. 计算金额 (双轨制)
-            # 责任人: 3张; 路人: 4张
-            amt_for_victim = 3 * int(common_v.get(cname, 0))
-            amt_for_others = 4 * int(common_v.get(cname, 0))
-
-            # 3. 执行结算
-
-            # 3.1 针对 责任人 (real_victim)
-            if real_victim and real_victim in pay_set:
-                if owner in receive_set_actual:
-                    add_transfer(transfers, owner, real_victim, amt_for_victim, f"🐔 杠牌剩余-{cname}(3张)")
-                elif owner in pay_set and real_victim in receive_set_actual:
-                    add_transfer(transfers, real_victim, owner, amt_for_victim, f"未听牌-赔付杠牌剩余-{cname}(3张)")
-
-            # 3.2 针对 其他人 (bystanders)
-            bystanders = [p for p in pay_set if p != owner and p != real_victim]
-            for p in bystanders:
-                if owner in receive_set_actual:
-                    add_transfer(transfers, owner, p, amt_for_others, f"🐔 杠牌剩余-{cname}(4张)")
-                elif owner in pay_set and p in receive_set_actual:
-                    add_transfer(transfers, p, owner, amt_for_others, f"未听牌-赔付杠牌剩余-{cname}(4张)")
-
-    # 执行检测
-    check_bump_remain("幺鸡", first_yj_who, first_yj_res, first_yj_tar, v_yj)
-    check_bump_remain("八筒", first_b8_who, first_b8_res, first_b8_tar, v_b8)
-    check_gang_remain(1)
-
-    return transfers
-
-
-def settle_not_ready_baopay_v20(
-        *, not_ready_set, pay_set, receive_set_actual, common_v,
+def calculate_all_pipeline(
+        players, winners, method, loser, hu_shape, is_qing, special_events, rules_config,
+        fan_card, ready_list,
         first_yj_who, first_yj_res, first_yj_tar,
         first_b8_who, first_b8_res, first_b8_tar,
-) -> List[Transfer]:
-    """
-    V25 未听牌包赔 - 仅剩余项目（责任鸡 & 冲锋鸡）
-    """
-    transfers = []
-    if not not_ready_set: return transfers
+        extra_yj, extra_b8,
+        hand_total_counts, gang_data, common_v, fan_unit=1
+) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
+    raw_txs: List[Transaction] = []
 
-    receive_set_hypo = set(receive_set_actual) | set(not_ready_set)
-
-    # 1. 责任鸡反转
-    hypo_resp = []
-    hypo_resp += settle_common_first_responsibility(pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who,
-                                                    first_yj_res, first_yj_tar)
-    hypo_resp += settle_common_first_responsibility(pay_set, receive_set_hypo, common_v, "八筒", first_b8_who,
-                                                    first_b8_res, first_b8_tar)
-
-    for tr in hypo_resp:
-        if tr.receiver in not_ready_set and tr.payer in receive_set_actual:
-            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(责任鸡应得翻转): {tr.reason}")
-
-    # 2. 冲锋鸡反转
-    hypo_charge = []
-    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "幺鸡", first_yj_who,
-                                                  first_yj_res)
-    hypo_charge += settle_charge_chicken_pairwise(pay_set, receive_set_hypo, common_v, "八筒", first_b8_who,
-                                                  first_b8_res)
-
-    for tr in hypo_charge:
-        if tr.receiver in not_ready_set and tr.payer in receive_set_actual:
-            add_transfer(transfers, tr.payer, tr.receiver, tr.amount, f"未听牌-包赔(冲锋鸡应得翻转): {tr.reason}")
-
-    return transfers
-
-
-# -------------------------------
-# Main calculate (Aggregator) - V25
-# -------------------------------
-def calculate_all(players, winners, method, loser, hu_shape, is_qing, special_events, rules_config, fan_card,
-                  ready_list, first_yj_who, first_yj_res, first_yj_tar, first_b8_who, first_b8_res, first_b8_tar,
-                  extra_yj, extra_b8, hand_total_counts, gang_data, common_v, fan_unit=1) -> Tuple[
-    Dict[str, int], Dict[str, List[str]]]:
     winners_set = set(winners)
-    ready_set = set([p for p in ready_list if p in players])
-    eligible_set = set([p for p in players if p in (ready_set | winners_set)])
+    # 【逻辑公理】胡牌者视为已听牌
+    ready_set = set([p for p in ready_list if p in players]) | winners_set
 
-    burn_trigger = (method == "点炮") and (("热炮" in special_events) or ("抢杠胡" in special_events))
-    burn_player = loser if burn_trigger else None
-    burn_player_is_ready = False
-    if burn_player and (burn_player in ready_set): burn_player_is_ready = True
-
-    not_ready_set = set([p for p in players if p not in eligible_set])
-
+    # 验证逻辑
     validate_objective_facts(
-        players=players,
-        fan_card=fan_card,
-        hand_total_counts={p: int(hand_total_counts.get(p, 0)) for p in players},
+        players=players, fan_card=fan_card, hand_total_counts=hand_total_counts,
         first_yj_who=first_yj_who, first_yj_res=first_yj_res, first_yj_tar=first_yj_tar,
         first_b8_who=first_b8_who, first_b8_res=first_b8_res, first_b8_tar=first_b8_tar,
-        extra_yj=extra_yj,
-        extra_b8=extra_b8,
-        gang_data=gang_data,
+        extra_yj=extra_yj, extra_b8=extra_b8,
+        gang_data=gang_data
     )
-
     validate_winner_and_event_consistency(
-        players=players,
-        winners=winners,
-        method=method,
+        players=players, winners=winners, method=method,
         first_yj_who=first_yj_who, first_yj_res=first_yj_res, first_yj_tar=first_yj_tar,
         first_b8_who=first_b8_who, first_b8_res=first_b8_res, first_b8_tar=first_b8_tar,
-        gang_data=gang_data,
+        gang_data=gang_data
     )
 
-    burn_ready_player = burn_player if (burn_trigger and burn_player and burn_player_is_ready) else None
-    receive_set = set(eligible_set)
-    if burn_ready_player: receive_set.discard(burn_ready_player)
+    def get_unit_price(card_name):
+        return int(common_v.get(card_name, 0))
 
-    pay_set = set(receive_set) | set(not_ready_set)
-    if burn_ready_player: pay_set.add(burn_ready_player)
-
-    transfers = []
-
-    # 1. 胡牌
+    # ==========================
+    # Stage 1.1: 胡牌结算
+    # ==========================
     if winners:
-        transfers += settle_hu(players, winners, method, loser, hu_shape, is_qing, special_events, rules_config)
+        base = int(rules_config.get(hu_shape, 0)) + (int(rules_config.get("清一色加成", 0)) if is_qing else 0)
+        spec = sum(int(rules_config.get(e, 0)) for e in special_events)
+        total_score = base + spec
+        desc = f"{hu_shape}" + (f"+清" if is_qing else "") + (f"+{'+'.join(special_events)}" if special_events else "")
 
-    # 2. 翻鸡 (独立互斥)
-    transfers += settle_fan_chicken_pairwise(pay_set, receive_set,
-                                             {p: int(hand_total_counts.get(p, 0)) for p in players}, unit=int(fan_unit))
+        if method == "自摸":
+            w = winners[0]
+            for p in players:
+                if p != w:
+                    raw_txs.append(Transaction(p, w, total_score, f"自摸({desc})", "hu"))
+        elif method == "点炮":
+            if loser:
+                for w in winners:
+                    raw_txs.append(Transaction(loser, w, total_score, f"点炮({desc})", "hu"))
 
-    # 3. 杠牌基础分 (Action Score) - 全场支付
-    gp = set(eligible_set)
-    if burn_ready_player: gp.discard(burn_ready_player)
-    transfers += settle_gang_base_points(gang_data, gp, burn_ready_player, not_ready_set)
+    # ==========================
+    # Stage 1.2: 杠牌基础分
+    # ==========================
+    for g in gang_data:
+        doer = g.get('doer')
+        gtype = g.get('type')
+        victim = g.get('victim')
+        card = g.get('card')
 
-    # 4. 责任鸡 (1张，双倍)
-    transfers += settle_common_first_responsibility(pay_set, receive_set, common_v, "幺鸡", first_yj_who, first_yj_res,
-                                                    first_yj_tar)
-    transfers += settle_common_first_responsibility(pay_set, receive_set, common_v, "八筒", first_b8_who, first_b8_res,
-                                                    first_b8_tar)
+        if not doer: continue
 
-    # 5. 手牌常鸡 (纯手牌互斥)
-    hand_totals = build_hand_chicken_totals(players, receive_set, common_v, extra_yj, extra_b8)
-    transfers += settle_hand_chicken_pairwise(pay_set, receive_set, hand_totals)
+        score = 0
+        is_all_pay = False
 
-    # 6. 碰/杠 剩余常鸡 (双轨制计分) - 🚨 V25 修复：碰牌也适用双轨制
-    transfers += settle_remaining_bump_kong_items(
-        players=players, pay_set=pay_set, receive_set_actual=receive_set, common_v=common_v, gang_data=gang_data,
-        first_yj_who=first_yj_who, first_yj_res=first_yj_res, first_yj_tar=first_yj_tar,
-        first_b8_who=first_b8_who, first_b8_res=first_b8_res, first_b8_tar=first_b8_tar
-    )
+        if gtype == "暗杠":
+            score = 4;
+            is_all_pay = True
+        elif gtype == "补杠":
+            score = 2;
+            is_all_pay = True
+        elif gtype in ["普通明杠", "责任明杠"]:
+            score = 2;
+            is_all_pay = False
 
-    # 7. 冲锋鸡 (互斥)
-    transfers += settle_charge_chicken_pairwise(pay_set, receive_set, common_v, "幺鸡", first_yj_who, first_yj_res)
-    transfers += settle_charge_chicken_pairwise(pay_set, receive_set, common_v, "八筒", first_b8_who, first_b8_res)
+        if is_all_pay:
+            for p in players:
+                if p != doer:
+                    raw_txs.append(Transaction(p, doer, score, f"{gtype}-{card}", "gang"))
+        else:
+            if victim and victim in players:
+                raw_txs.append(Transaction(victim, doer, score, f"{gtype}-{card}", "gang"))
 
-    # 8. 未听牌包赔 (仅处理 责任鸡 & 冲锋鸡 的反转)
-    transfers += settle_not_ready_baopay_v20(
-        not_ready_set=not_ready_set, pay_set=pay_set, receive_set_actual=receive_set, common_v=common_v,
-        first_yj_who=first_yj_who, first_yj_res=first_yj_res, first_yj_tar=first_yj_tar,
-        first_b8_who=first_b8_who, first_b8_res=first_b8_res, first_b8_tar=first_b8_tar
-    )
+    # ==========================
+    # Stage 1.3: 翻鸡 (互斥)
+    # ==========================
+    # 翻鸡通常被视为“运气”，未听牌者通常归零处理，所以这里仍用互斥，
+    # 并在 Stage 2 中不列入包赔名单 (chicken_extra 也不包含它)
+    for i in range(len(players)):
+        for j in range(i + 1, len(players)):
+            p1, p2 = players[i], players[j]
+            c1 = int(hand_total_counts.get(p1, 0))
+            c2 = int(hand_total_counts.get(p2, 0))
+            if c1 == c2: continue
 
+            diff = abs(c1 - c2) * fan_unit
+            winner, loser = (p1, p2) if c1 > c2 else (p2, p1)
+            # category 设为 'chicken_fan_luck' 以区别于 extra
+            raw_txs.append(Transaction(loser, winner, diff, "翻鸡互斥", "chicken_fan_luck"))
+
+    # ==========================
+    # Stage 1.4: 常鸡结算 (统一模型)
+    # ==========================
+
+    # A. 冲锋鸡 (Charge Chicken)
+    def check_charge(card_name, who, res):
+        if who and who != "无/未现" and res == "安全":
+            unit = get_unit_price(card_name)
+            if unit <= 0: return
+            val = unit * 2
+            for p in players:
+                if p != who:
+                    raw_txs.append(Transaction(p, who, val, f"冲锋鸡-{card_name}", "chicken_charge"))
+
+    check_charge("幺鸡", first_yj_who, first_yj_res)
+    check_charge("八筒", first_b8_who, first_b8_res)
+
+    # B. [NEW] 非首出常鸡 (Extra Chicken) - 独立广播模型
+    # ----------------------------------------------------
+    # 策略：每个人拥有的常鸡，都生成向其他人收钱的交易。
+    # 之后：如果持有者没听牌，这笔“收钱”会反转变成“赔钱”。
+    # 效果：若两人都听牌，互相收，抵消后等于互斥。若一人不听，反转叠加，等于包赔。
+
+    extra_values = {p: 0 for p in players}
+    for p in players:
+        v_yj = extra_yj.get(p, 0) * get_unit_price("幺鸡")
+        v_b8 = extra_b8.get(p, 0) * get_unit_price("八筒")
+        extra_values[p] = v_yj + v_b8
+
+    for owner in players:
+        val = extra_values[owner]
+        if val > 0:
+            for payer in players:
+                if payer != owner:
+                    # 初始交易：所有人都给 Owner 钱
+                    raw_txs.append(Transaction(payer, owner, val, "常鸡(非首出)", "chicken_extra"))
+
+    # C. 落地常鸡 (Landed Chickens: 碰/杠/胡) - 统一双轨制逻辑
+    landed_sets = []
+
+    # C.1 提取杠
+    for g in gang_data:
+        if g['card'] in ["幺鸡", "八筒"]:
+            victim = None
+            if g['type'] == "责任明杠":
+                victim = g['victim']
+            elif g['type'] == "补杠":
+                if g['card'] == "幺鸡" and first_yj_res == "被碰" and first_yj_tar == g['doer']:
+                    victim = first_yj_who
+                elif g['card'] == "八筒" and first_b8_res == "被碰" and first_b8_tar == g['doer']:
+                    victim = first_b8_who
+
+            landed_sets.append({
+                'owner': g['doer'], 'card': g['card'], 'count': 4,
+                'liability_victim': victim, 'type_desc': g['type']
+            })
+
+    # C.2 提取碰
+    if first_yj_res == "被碰" and first_yj_tar:
+        has_upgraded = False
+        for g in gang_data:
+            if g['card'] == "幺鸡" and g['type'] == "补杠" and g['doer'] == first_yj_tar:
+                has_upgraded = True;
+                break
+        if not has_upgraded:
+            landed_sets.append({
+                'owner': first_yj_tar, 'card': '幺鸡', 'count': 3,
+                'liability_victim': first_yj_who, 'type_desc': '碰'
+            })
+    if first_b8_res == "被碰" and first_b8_tar:
+        has_upgraded = False
+        for g in gang_data:
+            if g['card'] == "八筒" and g['type'] == "补杠" and g['doer'] == first_b8_tar:
+                has_upgraded = True;
+                break
+        if not has_upgraded:
+            landed_sets.append({
+                'owner': first_b8_tar, 'card': '八筒', 'count': 3,
+                'liability_victim': first_b8_who, 'type_desc': '碰'
+            })
+
+    # C.3 提取胡 (1张)
+    def add_hu_chicken(card_name, res, tar, victim):
+        if res == "被胡" and tar and victim:
+            targets = tar if isinstance(tar, list) else [tar]
+            for t in targets:
+                landed_sets.append({
+                    'owner': t, 'card': card_name, 'count': 1,
+                    'liability_victim': victim, 'type_desc': '胡'
+                })
+
+    add_hu_chicken("幺鸡", first_yj_res, first_yj_tar, first_yj_who)
+    add_hu_chicken("八筒", first_b8_res, first_b8_tar, first_b8_who)
+
+    # C.4 统一计算落地牌组
+    for item in landed_sets:
+        owner = item['owner']
+        card = item['card']
+        count = item['count']
+        victim = item['liability_victim']
+        unit = get_unit_price(card)
+
+        if unit <= 0: continue
+
+        for p in players:
+            if p == owner: continue
+
+            amount = 0
+            is_victim_pay = (victim and p == victim)
+
+            if is_victim_pay:
+                amount = (2 * unit) + (unit * (count - 1))
+                reason = f"{item['type_desc']}鸡-{card}({count}张,责任)"
+            else:
+                amount = unit * count
+                reason = f"{item['type_desc']}鸡-{card}({count}张)"
+
+            raw_txs.append(Transaction(p, owner, amount, reason, "chicken_resp"))
+
+    # ==========================
+    # Stage 2: 听牌状态过滤 (The Filter)
+    # ==========================
+    final_transfers = []
+
+    for tx in raw_txs:
+        payer = tx.payer
+        receiver = tx.receiver
+
+        payer_ready = payer in ready_set
+        receiver_ready = receiver in ready_set
+
+        # 1. 收款人 已听牌：正常收款
+        if receiver_ready:
+            final_transfers.append(tx)
+
+        # 2. 收款人 未听牌：触发包赔检查
+        else:
+            should_reverse = False
+
+            # 【包赔白名单】
+            # - gang (杠): 包赔
+            # - chicken_charge (冲锋): 包赔
+            # - chicken_resp (责任/碰/胡): 包赔
+            # - chicken_extra (非首出常鸡): 包赔 [NEW - 根据录入策略]
+
+            if tx.category in ["gang", "chicken_charge", "chicken_resp", "chicken_extra"]:
+                should_reverse = True
+
+            if should_reverse:
+                if payer_ready:
+                    final_transfers.append(tx.reverse())
+                else:
+                    pass  # 双方都未听牌：包赔无效，互免
+            else:
+                pass  # 不包赔类别(如翻鸡)，归零处理
+
+    # ==========================
+    # 3. 汇总输出
+    # ==========================
     scores = {p: 0 for p in players}
     details = {p: [] for p in players}
-    for tr in transfers:
-        if tr.receiver in players and tr.payer in players:
-            scores[tr.receiver] += tr.amount
-            scores[tr.payer] -= tr.amount
-            details[tr.receiver].append(f"{tr.reason}: +{int(tr.amount)}（{tr.payer}付）")
-            details[tr.payer].append(f"{tr.reason}: -{int(tr.amount)}（付给{tr.receiver}）")
+
+    for tr in final_transfers:
+        scores[tr.receiver] += tr.amount
+        scores[tr.payer] -= tr.amount
+        details[tr.receiver].append(f"{tr.reason}: +{tr.amount} ({tr.payer})")
+        details[tr.payer].append(f"{tr.reason}: -{tr.amount} ({tr.receiver})")
+
     return scores, details
 
 
 # ==============================================================================
-# UI - V25 Ultimate Stable
+# UI - V37 Fix Layout
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="捉鸡Pro - V25", page_icon="🀄", layout="wide")
+    st.set_page_config(page_title="捉鸡Pro - V37", page_icon="🀄", layout="wide")
 
     main_round = int(st.session_state.get("main_round", 0))
     K = lambda s: f"main_{main_round}_{s}"
 
-    # ---------------- UI helpers (visual only) ----------------
     def ui_section(title: str, icon: str = "", caption: Optional[str] = None):
         cap_html = f'<span class="glass-caption">{caption}</span>' if caption else ""
         st.markdown(
@@ -609,21 +504,17 @@ def main():
     # ---------------- Sidebar ----------------
     with st.sidebar:
         st.header("⚙️ 全局设定")
-
         if "p_names" not in st.session_state:
             st.session_state.p_names = ["玩家A", "玩家B", "玩家C", "玩家D"]
-
         with st.expander("👥 玩家署名", expanded=True):
             new_names = []
             for i, n in enumerate(st.session_state.p_names):
                 new_names.append(st.text_input(f"座位 {i + 1}", n, key=f"pn_{i}"))
             st.session_state.p_names = new_names
-
         players = st.session_state.p_names
         if len(set(players)) != len(players):
             st.error("名字冲突！请修改。")
             st.stop()
-
         st.subheader("🔧 规则分值")
         rules_config: Dict[str, int] = {}
         with st.expander("牌型与事件分", expanded=False):
@@ -637,7 +528,6 @@ def main():
             default_events = {"报听胡": 25, "杀报": 50, "杠上花": 25, "抢杠胡": 25, "热炮": 25, "天胡": 75, "地胡": 50}
             for k, v in default_events.items():
                 rules_config[k] = st.number_input(f"{k}", value=v, step=5)
-
         with st.expander("🐔 常鸡价值定义", expanded=False):
             c1, c2 = st.columns(2)
             with c1:
@@ -649,569 +539,59 @@ def main():
                 base_b8 = st.number_input("基础值 (8筒)", value=2, min_value=0)
                 mul_b8 = st.number_input("倍数 (8筒)", value=1, min_value=1)
             st.caption("注: 翻到9条/7筒时，对应常鸡价值会自动翻倍。")
-
         with st.expander("🖐️ 翻鸡单位", expanded=False):
             fan_unit = st.number_input("互斥基础分 (Unit)", value=1, min_value=0)
 
     # ================== CSS INJECTION (SAFE MODE) ==================
     st.markdown("""
         <style>
-        /* =============================
-           iOS 26-ish Liquid Glass UI
-           (Streamlit-safe, no transforms)
-           ============================= */
-
-        :root {
-            /* App background */
-            --bg-0: #05070b;
-            --bg-1: #07111b;
-            --bg-2: #0b1f2e;
-
-            /* Glass surfaces */
-            --glass-strong: rgba(22, 27, 38, 0.72);
-            --glass: rgba(22, 27, 38, 0.55);
-            --glass-soft: rgba(22, 27, 38, 0.38);
-
-            /* Borders / separators */
-            --hairline: rgba(255, 255, 255, 0.16);
-            --hairline-2: rgba(255, 255, 255, 0.10);
-
-            /* Text */
-            --text: rgba(255,255,255,0.96);
-            --text-dim: rgba(255,255,255,0.74);
-            --text-faint: rgba(255,255,255,0.56);
-
-            /* Accent (vibrant iOS-like) */
-            --accent: rgba(46, 217, 255, 0.95);
-            --accent-2: rgba(132, 103, 255, 0.95);
-            --accent-3: rgba(0, 245, 152, 0.95);
-
-            /* Shadows */
-            --shadow-1: 0 14px 40px rgba(0,0,0,0.35);
-            --shadow-2: 0 8px 22px rgba(0,0,0,0.28);
-
-            /* Radii */
-            --r-xl: 22px;
-            --r-lg: 18px;
-            --r-md: 14px;
-            --r-sm: 12px;
-
-            /* Blur */
-            --blur-strong: blur(22px) saturate(135%);
-            --blur: blur(16px) saturate(128%);
-            --blur-soft: blur(12px) saturate(120%);
-        }
-
-        /* App background: deep space + soft aurora highlights */
-        .stApp {
-            background:
-              radial-gradient(900px 480px at 18% 12%, rgba(46, 217, 255, 0.22), rgba(0,0,0,0) 60%),
-              radial-gradient(760px 520px at 82% 16%, rgba(132, 103, 255, 0.20), rgba(0,0,0,0) 58%),
-              radial-gradient(880px 520px at 52% 92%, rgba(0, 245, 152, 0.14), rgba(0,0,0,0) 62%),
-              linear-gradient(140deg, var(--bg-0), var(--bg-1) 35%, var(--bg-2));
-            background-attachment: fixed;
-        }
-
-        /* Typography: clean, iOS-like */
-        html, body, [class*="css"], .stMarkdown, .stText, .stCaption, label {
-            color: var(--text) !important;
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-            letter-spacing: 0.1px;
-        }
-
-        /* Remove default separators noise */
-        hr { display: none !important; }
-        footer { visibility: hidden; }
-
-        /* Sidebar as glass sheet */
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, rgba(18, 22, 32, 0.78), rgba(18, 22, 32, 0.62)) !important;
-            border-right: 1px solid var(--hairline-2) !important;
-            box-shadow: 10px 0 40px rgba(0,0,0,0.25);
-            backdrop-filter: var(--blur-strong);
-            -webkit-backdrop-filter: var(--blur-strong);
-        }
-        [data-testid="stSidebar"] * {
-            color: var(--text) !important;
-        }
-
-        /* Primary content container spacing (more iOS padding) */
-        .main .block-container {
-            padding-top: 1.35rem;
-            padding-bottom: 2.2rem;
-            max-width: 1200px;
-        }
-
-        /* Glass cards: Streamlit container border wrapper */
-        [data-testid="stVerticalBlockBorderWrapper"] {
-            position: relative;
-            background: linear-gradient(180deg, var(--glass-strong), var(--glass)) !important;
-            border: 1px solid var(--hairline) !important;
-            border-radius: var(--r-xl) !important;
-            padding: 18px 18px 16px 18px !important;
-            margin-bottom: 16px !important;
-            box-shadow: var(--shadow-2);
-            backdrop-filter: var(--blur);
-            -webkit-backdrop-filter: var(--blur);
-            overflow: hidden;
-        }
-
-        /* Card inner sheen (liquid highlight) */
-        [data-testid="stVerticalBlockBorderWrapper"]::before {
-            content: "";
-            position: absolute;
-            inset: -2px;
-            background:
-              radial-gradient(520px 120px at 24% 8%, rgba(255,255,255,0.14), rgba(255,255,255,0) 60%),
-              radial-gradient(480px 140px at 82% 18%, rgba(255,255,255,0.10), rgba(255,255,255,0) 62%),
-              linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.00) 28%);
-            pointer-events: none;
-        }
-
-        /* Headings styling (vibrant but readable) */
-        h1 {
-            font-weight: 900 !important;
-            font-size: 2.0rem !important;
-            line-height: 1.15;
-            margin-bottom: 0.25rem;
-        }
-        h2, h3 {
-            font-weight: 800 !important;
-        }
-
-        /* Existing header class: upgrade to iOS “vibrancy” text */
-        .glass-header {
-            font-size: 1.25rem;
-            font-weight: 900;
-            color: var(--text);
-            margin-bottom: 0.85rem;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .glass-header-icon {
-            font-size: 1.45rem;
-            filter: drop-shadow(0 6px 16px rgba(0,0,0,0.35));
-        }
-        .glass-caption {
-            font-size: 0.82rem;
-            color: var(--text-dim) !important;
-            margin-left: auto;
-            font-weight: 650;
-            padding: 4px 10px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.08);
-            border: 1px solid var(--hairline-2);
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-        }
-
-        /* Inputs as frosted fields */
-        [data-testid="stNumberInput"] input,
-        [data-testid="stTextInput"] input,
-        [data-testid="stSelectbox"] div[role="combobox"],
-        [data-testid="stMultiSelect"] div[role="combobox"] {
-            background: rgba(255,255,255,0.08) !important;
-            color: var(--text) !important;
-            border: 1px solid rgba(255,255,255,0.14) !important;
-            border-radius: 14px !important;
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-            box-shadow: 0 8px 20px rgba(0,0,0,0.20);
-        }
-
-        /* Number input alignment */
-        [data-testid="stNumberInput"] input {
-            text-align: center;
-            font-weight: 750;
-        }
-
-        /* Radio / checkbox as pill glass */
-        [data-testid="stRadio"] div[role="radiogroup"],
-        [data-testid="stCheckbox"] {
-            border-radius: 16px;
-        }
-
-        /* Buttons: iOS glass capsules */
-        .stButton > button {
-            border-radius: 999px !important;
-            border: 1px solid rgba(255,255,255,0.16) !important;
-            background: linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.08)) !important;
-            color: var(--text) !important;
-            font-weight: 850 !important;
-            letter-spacing: 0.2px;
-            padding: 0.72rem 1.05rem !important;
-            box-shadow: var(--shadow-2);
-            backdrop-filter: var(--blur);
-            -webkit-backdrop-filter: var(--blur);
-        }
-        .stButton > button:hover {
-            border-color: rgba(255,255,255,0.24) !important;
-            background: linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0.10)) !important;
-        }
-        .stButton > button:active {
-            background: linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06)) !important;
-        }
-
-        /* Primary button: subtle accent glow (no animation) */
-        .stButton > button[kind="primary"],
-        div[data-testid="stButton"] > button[kind="primary"] {
-            border: 1px solid rgba(46, 217, 255, 0.30) !important;
-            background:
-              radial-gradient(520px 160px at 30% 20%, rgba(46, 217, 255, 0.22), rgba(0,0,0,0) 55%),
-              radial-gradient(520px 180px at 78% 30%, rgba(132, 103, 255, 0.18), rgba(0,0,0,0) 60%),
-              linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.08)) !important;
-            box-shadow: 0 14px 44px rgba(0,0,0,0.34), 0 0 0 1px rgba(46,217,255,0.12);
-        }
-
-        /* Expanders: glass panel */
-        details, [data-testid="stExpander"] {
-            border-radius: var(--r-lg) !important;
-        }
-        [data-testid="stExpander"] > details {
-            background: rgba(255,255,255,0.06) !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
-            border-radius: var(--r-lg) !important;
-            box-shadow: 0 10px 26px rgba(0,0,0,0.20);
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-            overflow: hidden;
-        }
-
-        /* Metrics (result tiles) */
-        [data-testid="stMetric"] {
-            background: rgba(255,255,255,0.06) !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
-            border-radius: 18px !important;
-            padding: 12px 14px !important;
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-            box-shadow: 0 10px 26px rgba(0,0,0,0.20);
-        }
-
-        /* Your custom “ticket” list: make it more iOS glass */
-        .holo-ticket {
-            padding: 12px 16px;
-            margin-bottom: 10px;
-            border-radius: 18px;
-            background:
-              radial-gradient(420px 140px at 18% 20%, rgba(255,255,255,0.14), rgba(255,255,255,0) 60%),
-              linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06));
-            border: 1px solid rgba(255,255,255,0.14);
-            box-shadow: 0 10px 26px rgba(0,0,0,0.24);
-            backdrop-filter: var(--blur);
-            -webkit-backdrop-filter: var(--blur);
-        }
-        .tx-arrow { color: var(--text-faint); font-size: 0.85rem; }
-        .tx-pay, .tx-get { text-shadow: 0 8px 20px rgba(0,0,0,0.35); }
-        .tx-amt-box { text-shadow: 0 10px 26px rgba(0,0,0,0.35); }
-
-        /* Alerts: soften */
-        [data-testid="stAlert"] {
-            border-radius: 18px !important;
-            border: 1px solid rgba(255,255,255,0.14) !important;
-            background: rgba(255,255,255,0.06) !important;
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-        }
-
-        /* Mobile tweaks */
-        @media (max-width: 768px) {
-            .main .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
-            h1 { font-size: 1.65rem !important; }
-            .glass-header { font-size: 1.12rem; }
-            [data-testid="stNumberInput"] input { font-size: 16px; }
-        }
-        /* ===== iOS Chrome compatibility + UX polish ===== */
-
-        /* Soft grain overlay (helps Liquid Glass feel even when blur is weak) */
-        .stApp::after {
-            content: "";
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            background:
-              radial-gradient(1px 1px at 18% 22%, rgba(255,255,255,0.035) 50%, rgba(0,0,0,0) 52%),
-              radial-gradient(1px 1px at 62% 48%, rgba(255,255,255,0.030) 50%, rgba(0,0,0,0) 52%),
-              radial-gradient(1px 1px at 78% 74%, rgba(255,255,255,0.028) 50%, rgba(0,0,0,0) 52%);
-            background-size: 160px 160px;
-            opacity: 0.55;
-            mix-blend-mode: overlay;
-        }
-
-        /* Stickies */
-        .sticky-panel {
-            position: sticky;
-            top: 14px;
-            z-index: 5;
-        }
-
-        /* Pill chips */
-        .chip {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 6px 10px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.14);
-            color: var(--text-dim);
-            font-size: 0.82rem;
-            font-weight: 700;
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-        }
-
-        /* Sticky action bar */
-        .action-bar {
-            position: sticky;
-            top: 10px;
-            z-index: 6;
-            background: linear-gradient(180deg, rgba(18,22,32,0.72), rgba(18,22,32,0.45));
-            border: 1px solid rgba(255,255,255,0.14);
-            border-radius: 20px;
-            padding: 12px 12px 10px 12px;
-            box-shadow: var(--shadow-2);
-            backdrop-filter: var(--blur-strong);
-            -webkit-backdrop-filter: var(--blur-strong);
-            overflow: hidden;
-            margin-bottom: 14px;
-        }
-        .action-bar::before {
-            content: "";
-            position: absolute;
-            inset: -2px;
-            pointer-events: none;
-            background:
-              radial-gradient(520px 140px at 18% 10%, rgba(255,255,255,0.14), rgba(255,255,255,0) 58%),
-              linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.00) 32%);
-        }
-
-        /* Improve focus ring (touch UX) */
-        button:focus, input:focus, [role="combobox"]:focus {
-            outline: none !important;
-            box-shadow: 0 0 0 2px rgba(46, 217, 255, 0.18), 0 10px 26px rgba(0,0,0,0.24) !important;
-        }
-
-        /* Dropdown menu surface */
-        [data-baseweb="popover"] > div {
-            background: rgba(18, 22, 32, 0.86) !important;
-            border: 1px solid rgba(255,255,255,0.14) !important;
-            backdrop-filter: var(--blur-strong);
-            -webkit-backdrop-filter: var(--blur-strong);
-            border-radius: 16px !important;
-            box-shadow: 0 18px 46px rgba(0,0,0,0.45) !important;
-        }
-
-        /* Scrollbar subtle */
-        ::-webkit-scrollbar { width: 10px; height: 10px; }
-        ::-webkit-scrollbar-thumb {
-            background: rgba(255,255,255,0.14);
-            border: 2px solid rgba(0,0,0,0);
-            background-clip: padding-box;
-            border-radius: 999px;
-        }
-        ::-webkit-scrollbar-track { background: rgba(0,0,0,0.0); }
-
-        /* Reduce heavy effects if user prefers */
-        @media (prefers-reduced-transparency: reduce) {
-            [data-testid="stVerticalBlockBorderWrapper"],
-            [data-testid="stSidebar"],
-            .action-bar {
-                backdrop-filter: none !important;
-                -webkit-backdrop-filter: none !important;
-            }
-            .stApp::after { opacity: 0.25; }
-        }
-
-        /* =============================
-           Light Mode (iOS-like Frost)
-           - Only applies when the OS/browser is in light color scheme
-           - Does NOT affect dark mode
-           ============================= */
-        @media (prefers-color-scheme: light) {
-            :root {
-                --bg-0: #f6f8fb;
-                --bg-1: #eef3f8;
-                --bg-2: #e8f0f7;
-
-                --glass-strong: rgba(255, 255, 255, 0.72);
-                --glass: rgba(255, 255, 255, 0.58);
-                --glass-soft: rgba(255, 255, 255, 0.42);
-
-                --hairline: rgba(10, 20, 35, 0.12);
-                --hairline-2: rgba(10, 20, 35, 0.08);
-
-                --text: rgba(10, 18, 32, 0.92);
-                --text-dim: rgba(10, 18, 32, 0.68);
-                --text-faint: rgba(10, 18, 32, 0.52);
-
-                /* Slightly deeper accents for light backgrounds */
-                --accent: rgba(0, 122, 255, 0.92);
-                --accent-2: rgba(88, 86, 214, 0.90);
-                --accent-3: rgba(52, 199, 89, 0.90);
-
-                --shadow-1: 0 16px 46px rgba(15, 25, 40, 0.14);
-                --shadow-2: 0 10px 26px rgba(15, 25, 40, 0.12);
-
-                --blur-strong: blur(22px) saturate(130%);
-                --blur: blur(16px) saturate(125%);
-                --blur-soft: blur(12px) saturate(120%);
-            }
-
-            /* App background: light frost + subtle aurora */
-            .stApp {
-                background:
-                  radial-gradient(860px 520px at 16% 10%, rgba(0, 122, 255, 0.12), rgba(0,0,0,0) 62%),
-                  radial-gradient(760px 520px at 84% 16%, rgba(88, 86, 214, 0.10), rgba(0,0,0,0) 62%),
-                  radial-gradient(920px 560px at 56% 92%, rgba(52, 199, 89, 0.08), rgba(0,0,0,0) 66%),
-                  linear-gradient(140deg, var(--bg-0), var(--bg-1) 38%, var(--bg-2));
-                background-attachment: fixed;
-            }
-
-            /* Typography colors in light mode */
-            html, body, [class*="css"], .stMarkdown, .stText, .stCaption, label {
-                color: var(--text) !important;
-            }
-
-            /* Sidebar: light glass sheet */
-            [data-testid="stSidebar"] {
-                background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)) !important;
-                border-right: 1px solid var(--hairline-2) !important;
-                box-shadow: 10px 0 40px rgba(15,25,40,0.10);
-                backdrop-filter: var(--blur-strong);
-                -webkit-backdrop-filter: var(--blur-strong);
-            }
-            [data-testid="stSidebar"] * {
-                color: var(--text) !important;
-            }
-
-            /* Cards: brighter frost, slightly stronger border */
-            [data-testid="stVerticalBlockBorderWrapper"] {
-                background: linear-gradient(180deg, var(--glass-strong), var(--glass)) !important;
-                border: 1px solid var(--hairline) !important;
-                box-shadow: var(--shadow-2);
-            }
-            [data-testid="stVerticalBlockBorderWrapper"]::before {
-                background:
-                  radial-gradient(520px 120px at 24% 8%, rgba(255,255,255,0.55), rgba(255,255,255,0) 60%),
-                  radial-gradient(480px 140px at 82% 18%, rgba(255,255,255,0.40), rgba(255,255,255,0) 62%),
-                  linear-gradient(180deg, rgba(255,255,255,0.26), rgba(255,255,255,0.00) 28%);
-            }
-
-            /* Inputs: light frosted fields */
-            [data-testid="stNumberInput"] input,
-            [data-testid="stTextInput"] input,
-            [data-testid="stSelectbox"] div[role="combobox"],
-            [data-testid="stMultiSelect"] div[role="combobox"] {
-                background: rgba(255,255,255,0.72) !important;
-                color: var(--text) !important;
-                border: 1px solid rgba(10, 20, 35, 0.14) !important;
-                box-shadow: 0 10px 22px rgba(15,25,40,0.10);
-            }
-
-            /* Buttons: light glass capsules */
-            .stButton > button {
-                border: 1px solid rgba(10, 20, 35, 0.14) !important;
-                background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(255,255,255,0.70)) !important;
-                color: var(--text) !important;
-                box-shadow: 0 12px 24px rgba(15,25,40,0.12);
-            }
-            .stButton > button:hover {
-                border-color: rgba(10, 20, 35, 0.20) !important;
-                background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.76)) !important;
-            }
-            .stButton > button[kind="primary"],
-            div[data-testid="stButton"] > button[kind="primary"] {
-                border: 1px solid rgba(0, 122, 255, 0.28) !important;
-                background:
-                  radial-gradient(520px 160px at 30% 20%, rgba(0, 122, 255, 0.14), rgba(0,0,0,0) 58%),
-                  radial-gradient(520px 180px at 78% 30%, rgba(88, 86, 214, 0.10), rgba(0,0,0,0) 62%),
-                  linear-gradient(180deg, rgba(255,255,255,0.94), rgba(255,255,255,0.68)) !important;
-                box-shadow: 0 16px 34px rgba(15,25,40,0.14), 0 0 0 1px rgba(0,122,255,0.10);
-            }
-
-            /* Chips + action bar: light vibrancy */
-            .chip {
-                background: rgba(255,255,255,0.72);
-                border: 1px solid rgba(10,20,35,0.12);
-                color: var(--text-dim);
-            }
-            .action-bar {
-                background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.58));
-                border: 1px solid rgba(10,20,35,0.12);
-                box-shadow: 0 14px 34px rgba(15,25,40,0.12);
-            }
-
-            /* Dropdown menu surface: light */
-            [data-baseweb="popover"] > div {
-                background: rgba(255,255,255,0.92) !important;
-                border: 1px solid rgba(10,20,35,0.12) !important;
-                box-shadow: 0 18px 46px rgba(15,25,40,0.18) !important;
-            }
-
-            /* Tickets: light glass */
-            .holo-ticket {
-                background:
-                  radial-gradient(420px 140px at 18% 20%, rgba(255,255,255,0.70), rgba(255,255,255,0) 62%),
-                  linear-gradient(180deg, rgba(255,255,255,0.88), rgba(255,255,255,0.62));
-                border: 1px solid rgba(10,20,35,0.12);
-                box-shadow: 0 12px 26px rgba(15,25,40,0.12);
-            }
-
-            /* Grain: dial down for light backgrounds */
-            .stApp::after {
-                opacity: 0.28;
-                mix-blend-mode: multiply;
-            }
-
-            /* Focus ring: more visible in light mode */
-            button:focus, input:focus, [role="combobox"]:focus {
-                box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.18), 0 10px 26px rgba(15,25,40,0.12) !important;
-            }
-        }
-        /* UI dividers */
-        .ui-divider {
-            position: relative;
-            height: 1px;
-            background: rgba(255,255,255,0.10);
-            margin: 12px 0 12px 0;
-            border-radius: 999px;
-        }
-        .ui-divider > span {
-            position: absolute;
-            top: -11px;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 2px 10px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.12);
-            font-size: 0.78rem;
-            font-weight: 750;
-            color: var(--text-dim);
-            backdrop-filter: var(--blur-soft);
-            -webkit-backdrop-filter: var(--blur-soft);
-        }
-
-        /* Chip status variants */
-        .chip.ok { border-color: rgba(0,245,152,0.35); box-shadow: 0 0 0 1px rgba(0,245,152,0.10); }
-        .chip.warn { border-color: rgba(255,214,10,0.35); box-shadow: 0 0 0 1px rgba(255,214,10,0.10); }
-        .chip.bad { border-color: rgba(255,69,58,0.35); box-shadow: 0 0 0 1px rgba(255,69,58,0.10); }
-
-        /* Title subtitle */
-        .hero-sub {
-            margin-top: -6px;
-            margin-bottom: 12px;
-            color: var(--text-dim);
-            font-weight: 650;
-            font-size: 0.92rem;
-        }
-
-        /* Make expander summary a bit bolder */
-        details > summary {
-            font-weight: 800 !important;
-        }
+        :root { --bg-0: #05070b; --bg-1: #07111b; --bg-2: #0b1f2e; --glass-strong: rgba(22, 27, 38, 0.72); --glass: rgba(22, 27, 38, 0.55); --glass-soft: rgba(22, 27, 38, 0.38); --hairline: rgba(255, 255, 255, 0.16); --hairline-2: rgba(255, 255, 255, 0.10); --text: rgba(255,255,255,0.96); --text-dim: rgba(255,255,255,0.74); --text-faint: rgba(255,255,255,0.56); --accent: rgba(46, 217, 255, 0.95); --accent-2: rgba(132, 103, 255, 0.95); --accent-3: rgba(0, 245, 152, 0.95); --shadow-1: 0 14px 40px rgba(0,0,0,0.35); --shadow-2: 0 8px 22px rgba(0,0,0,0.28); --r-xl: 22px; --r-lg: 18px; --r-md: 14px; --r-sm: 12px; --blur-strong: blur(22px) saturate(135%); --blur: blur(16px) saturate(128%); --blur-soft: blur(12px) saturate(120%); }
+        .stApp { background: radial-gradient(900px 480px at 18% 12%, rgba(46, 217, 255, 0.22), rgba(0,0,0,0) 60%), radial-gradient(760px 520px at 82% 16%, rgba(132, 103, 255, 0.20), rgba(0,0,0,0) 58%), radial-gradient(880px 520px at 52% 92%, rgba(0, 245, 152, 0.14), rgba(0,0,0,0) 62%), linear-gradient(140deg, var(--bg-0), var(--bg-1) 35%, var(--bg-2)); background-attachment: fixed; }
+        html, body, [class*="css"], .stMarkdown, .stText, .stCaption, label { color: var(--text) !important; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.1px; }
+        hr { display: none !important; } footer { visibility: hidden; }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, rgba(18, 22, 32, 0.78), rgba(18, 22, 32, 0.62)) !important; border-right: 1px solid var(--hairline-2) !important; box-shadow: 10px 0 40px rgba(0,0,0,0.25); backdrop-filter: var(--blur-strong); -webkit-backdrop-filter: var(--blur-strong); } [data-testid="stSidebar"] * { color: var(--text) !important; }
+        .main .block-container { padding-top: 1.35rem; padding-bottom: 2.2rem; max-width: 1200px; }
+        [data-testid="stVerticalBlockBorderWrapper"] { position: relative; background: linear-gradient(180deg, var(--glass-strong), var(--glass)) !important; border: 1px solid var(--hairline) !important; border-radius: var(--r-xl) !important; padding: 18px 18px 16px 18px !important; margin-bottom: 16px !important; box-shadow: var(--shadow-2); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur); overflow: hidden; }
+        [data-testid="stVerticalBlockBorderWrapper"]::before { content: ""; position: absolute; inset: -2px; background: radial-gradient(520px 120px at 24% 8%, rgba(255,255,255,0.14), rgba(255,255,255,0) 60%), radial-gradient(480px 140px at 82% 18%, rgba(255,255,255,0.10), rgba(255,255,255,0) 62%), linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.00) 28%); pointer-events: none; }
+        h1 { font-weight: 900 !important; font-size: 2.0rem !important; line-height: 1.15; margin-bottom: 0.25rem; } h2, h3 { font-weight: 800 !important; }
+        .glass-header { font-size: 1.25rem; font-weight: 900; color: var(--text); margin-bottom: 0.85rem; display: flex; align-items: center; gap: 10px; } .glass-header-icon { font-size: 1.45rem; filter: drop-shadow(0 6px 16px rgba(0,0,0,0.35)); } .glass-caption { font-size: 0.82rem; color: var(--text-dim) !important; margin-left: auto; font-weight: 650; padding: 4px 10px; border-radius: 999px; background: rgba(255,255,255,0.08); border: 1px solid var(--hairline-2); backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); }
+        [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input, [data-testid="stSelectbox"] div[role="combobox"], [data-testid="stMultiSelect"] div[role="combobox"] { background: rgba(255,255,255,0.08) !important; color: var(--text) !important; border: 1px solid rgba(255,255,255,0.14) !important; border-radius: 14px !important; backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); box-shadow: 0 8px 20px rgba(0,0,0,0.20); } [data-testid="stNumberInput"] input { text-align: center; font-weight: 750; }
+        [data-testid="stRadio"] div[role="radiogroup"], [data-testid="stCheckbox"] { border-radius: 16px; }
+        .stButton > button { border-radius: 999px !important; border: 1px solid rgba(255,255,255,0.16) !important; background: linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.08)) !important; color: var(--text) !important; font-weight: 850 !important; letter-spacing: 0.2px; padding: 0.72rem 1.05rem !important; box-shadow: var(--shadow-2); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur); } .stButton > button:hover { border-color: rgba(255,255,255,0.24) !important; background: linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0.10)) !important; } .stButton > button:active { background: linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06)) !important; }
+        .stButton > button[kind="primary"], div[data-testid="stButton"] > button[kind="primary"] { border: 1px solid rgba(46, 217, 255, 0.30) !important; background: radial-gradient(520px 160px at 30% 20%, rgba(46, 217, 255, 0.22), rgba(0,0,0,0) 55%), radial-gradient(520px 180px at 78% 30%, rgba(132, 103, 255, 0.18), rgba(0,0,0,0) 60%), linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.08)) !important; box-shadow: 0 14px 44px rgba(0,0,0,0.34), 0 0 0 1px rgba(46,217,255,0.12); }
+        details, [data-testid="stExpander"] { border-radius: var(--r-lg) !important; } [data-testid="stExpander"] > details { background: rgba(255,255,255,0.06) !important; border: 1px solid rgba(255,255,255,0.12) !important; border-radius: var(--r-lg) !important; box-shadow: 0 10px 26px rgba(0,0,0,0.20); backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); overflow: hidden; }
+        [data-testid="stMetric"] { background: rgba(255,255,255,0.06) !important; border: 1px solid rgba(255,255,255,0.12) !important; border-radius: 18px !important; padding: 12px 14px !important; backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); box-shadow: 0 10px 26px rgba(0,0,0,0.20); }
+        .holo-ticket { padding: 12px 16px; margin-bottom: 10px; border-radius: 18px; background: radial-gradient(420px 140px at 18% 20%, rgba(255,255,255,0.14), rgba(255,255,255,0) 60%), linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06)); border: 1px solid rgba(255,255,255,0.14); box-shadow: 0 10px 26px rgba(0,0,0,0.24); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur); } .tx-arrow { color: var(--text-faint); font-size: 0.85rem; } .tx-pay, .tx-get { text-shadow: 0 8px 20px rgba(0,0,0,0.35); } .tx-amt-box { text-shadow: 0 10px 26px rgba(0,0,0,0.35); }
+        [data-testid="stAlert"] { border-radius: 18px !important; border: 1px solid rgba(255,255,255,0.14) !important; background: rgba(255,255,255,0.06) !important; backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); }
+        @media (max-width: 768px) { .main .block-container { padding-left: 0.8rem; padding-right: 0.8rem; } h1 { font-size: 1.65rem !important; } .glass-header { font-size: 1.12rem; } [data-testid="stNumberInput"] input { font-size: 16px; } }
+        .stApp::after { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(1px 1px at 18% 22%, rgba(255,255,255,0.035) 50%, rgba(0,0,0,0) 52%), radial-gradient(1px 1px at 62% 48%, rgba(255,255,255,0.030) 50%, rgba(0,0,0,0) 52%), radial-gradient(1px 1px at 78% 74%, rgba(255,255,255,0.028) 50%, rgba(0,0,0,0) 52%); background-size: 160px 160px; opacity: 0.55; mix-blend-mode: overlay; }
+        .sticky-panel { position: sticky; top: 14px; z-index: 5; }
+        .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); color: var(--text-dim); font-size: 0.82rem; font-weight: 700; backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); }
+        .action-bar { position: sticky; top: 10px; z-index: 6; background: linear-gradient(180deg, rgba(18,22,32,0.72), rgba(18,22,32,0.45)); border: 1px solid rgba(255,255,255,0.14); border-radius: 20px; padding: 12px 12px 10px 12px; box-shadow: var(--shadow-2); backdrop-filter: var(--blur-strong); -webkit-backdrop-filter: var(--blur-strong); overflow: hidden; margin-bottom: 14px; }
+        .action-bar::before { content: ""; position: absolute; inset: -2px; pointer-events: none; background: radial-gradient(520px 140px at 18% 10%, rgba(255,255,255,0.14), rgba(255,255,255,0) 58%), linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.00) 32%); }
+        button:focus, input:focus, [role="combobox"]:focus { outline: none !important; box-shadow: 0 0 0 2px rgba(46, 217, 255, 0.18), 0 10px 26px rgba(0,0,0,0.24) !important; }
+        [data-baseweb="popover"] > div { background: rgba(18, 22, 32, 0.86) !important; border: 1px solid rgba(255,255,255,0.14) !important; backdrop-filter: var(--blur-strong); -webkit-backdrop-filter: var(--blur-strong); border-radius: 16px !important; box-shadow: 0 18px 46px rgba(0,0,0,0.45) !important; }
+        ::-webkit-scrollbar { width: 10px; height: 10px; } ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border: 2px solid rgba(0,0,0,0); background-clip: padding-box; border-radius: 999px; } ::-webkit-scrollbar-track { background: rgba(0,0,0,0.0); }
+        @media (prefers-reduced-transparency: reduce) { [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stSidebar"], .action-bar { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; } .stApp::after { opacity: 0.25; } }
+        @media (prefers-color-scheme: light) { :root { --bg-0: #f6f8fb; --bg-1: #eef3f8; --bg-2: #e8f0f7; --glass-strong: rgba(255, 255, 255, 0.72); --glass: rgba(255, 255, 255, 0.58); --glass-soft: rgba(255, 255, 255, 0.42); --hairline: rgba(10, 20, 35, 0.12); --hairline-2: rgba(10, 20, 35, 0.08); --text: rgba(10, 18, 32, 0.92); --text-dim: rgba(10, 18, 32, 0.68); --text-faint: rgba(10, 18, 32, 0.52); --accent: rgba(0, 122, 255, 0.92); --accent-2: rgba(88, 86, 214, 0.90); --accent-3: rgba(52, 199, 89, 0.90); --shadow-1: 0 16px 46px rgba(15, 25, 40, 0.14); --shadow-2: 0 10px 26px rgba(15, 25, 40, 0.12); --blur-strong: blur(22px) saturate(130%); --blur: blur(16px) saturate(125%); --blur-soft: blur(12px) saturate(120%); }
+        .stApp { background: radial-gradient(860px 520px at 16% 10%, rgba(0, 122, 255, 0.12), rgba(0,0,0,0) 62%), radial-gradient(760px 520px at 84% 16%, rgba(88, 86, 214, 0.10), rgba(0,0,0,0) 62%), radial-gradient(920px 560px at 56% 92%, rgba(52, 199, 89, 0.08), rgba(0,0,0,0) 66%), linear-gradient(140deg, var(--bg-0), var(--bg-1) 38%, var(--bg-2)); background-attachment: fixed; }
+        html, body, [class*="css"], .stMarkdown, .stText, .stCaption, label { color: var(--text) !important; }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)) !important; border-right: 1px solid var(--hairline-2) !important; box-shadow: 10px 0 40px rgba(15,25,40,0.10); backdrop-filter: var(--blur-strong); -webkit-backdrop-filter: var(--blur-strong); } [data-testid="stSidebar"] * { color: var(--text) !important; }
+        [data-testid="stVerticalBlockBorderWrapper"] { background: linear-gradient(180deg, var(--glass-strong), var(--glass)) !important; border: 1px solid var(--hairline) !important; box-shadow: var(--shadow-2); }
+        [data-testid="stVerticalBlockBorderWrapper"]::before { background: radial-gradient(520px 120px at 24% 8%, rgba(255,255,255,0.55), rgba(255,255,255,0) 60%), radial-gradient(480px 140px at 82% 18%, rgba(255,255,255,0.40), rgba(255,255,255,0) 62%), linear-gradient(180deg, rgba(255,255,255,0.26), rgba(255,255,255,0.00) 28%); }
+        [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input, [data-testid="stSelectbox"] div[role="combobox"], [data-testid="stMultiSelect"] div[role="combobox"] { background: rgba(255,255,255,0.72) !important; color: var(--text) !important; border: 1px solid rgba(10, 20, 35, 0.14) !important; box-shadow: 0 10px 22px rgba(15,25,40,0.10); }
+        .stButton > button { border: 1px solid rgba(10, 20, 35, 0.14) !important; background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(255,255,255,0.70)) !important; color: var(--text) !important; box-shadow: 0 12px 24px rgba(15,25,40,0.12); } .stButton > button:hover { border-color: rgba(10, 20, 35, 0.20) !important; background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.76)) !important; }
+        .stButton > button[kind="primary"], div[data-testid="stButton"] > button[kind="primary"] { border: 1px solid rgba(0, 122, 255, 0.28) !important; background: radial-gradient(520px 160px at 30% 20%, rgba(0, 122, 255, 0.14), rgba(0,0,0,0) 58%), radial-gradient(520px 180px at 78% 30%, rgba(88, 86, 214, 0.10), rgba(0,0,0,0) 62%), linear-gradient(180deg, rgba(255,255,255,0.94), rgba(255,255,255,0.68)) !important; box-shadow: 0 16px 34px rgba(15,25,40,0.14), 0 0 0 1px rgba(0,122,255,0.10); }
+        .chip { background: rgba(255,255,255,0.72); border: 1px solid rgba(10,20,35,0.12); color: var(--text-dim); }
+        .action-bar { background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.58)); border: 1px solid rgba(10,20,35,0.12); box-shadow: 0 14px 34px rgba(15,25,40,0.12); }
+        [data-baseweb="popover"] > div { background: rgba(255,255,255,0.92) !important; border: 1px solid rgba(10,20,35,0.12) !important; box-shadow: 0 18px 46px rgba(15,25,40,0.18) !important; }
+        .holo-ticket { background: radial-gradient(420px 140px at 18% 20%, rgba(255,255,255,0.70), rgba(255,255,255,0) 62%), linear-gradient(180deg, rgba(255,255,255,0.88), rgba(255,255,255,0.62)); border: 1px solid rgba(10,20,35,0.12); box-shadow: 0 12px 26px rgba(15,25,40,0.12); }
+        .stApp::after { opacity: 0.28; mix-blend-mode: multiply; }
+        button:focus, input:focus, [role="combobox"]:focus { box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.18), 0 10px 26px rgba(15,25,40,0.12) !important; } }
+        .ui-divider { position: relative; height: 1px; background: rgba(255,255,255,0.10); margin: 12px 0 12px 0; border-radius: 999px; } .ui-divider > span { position: absolute; top: -11px; left: 50%; transform: translateX(-50%); padding: 2px 10px; border-radius: 999px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); font-size: 0.78rem; font-weight: 750; color: var(--text-dim); backdrop-filter: var(--blur-soft); -webkit-backdrop-filter: var(--blur-soft); }
+        .chip.ok { border-color: rgba(0,245,152,0.35); box-shadow: 0 0 0 1px rgba(0,245,152,0.10); } .chip.warn { border-color: rgba(255,214,10,0.35); box-shadow: 0 0 0 1px rgba(255,214,10,0.10); } .chip.bad { border-color: rgba(255,69,58,0.35); box-shadow: 0 0 0 1px rgba(255,69,58,0.10); }
+        .hero-sub { margin-top: -6px; margin-bottom: 12px; color: var(--text-dim); font-weight: 650; font-size: 0.92rem; }
+        details > summary { font-weight: 800 !important; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -1283,7 +663,6 @@ def main():
         with st.container(border=True):
             ui_section("首出常鸡", icon="🚀", caption=f"1条{common_v['幺鸡']}/8筒{common_v['八筒']}")
 
-            # Auto-disable mutual '被胡' (UI-only enforcement)
             key_fyr = K("fyr")
             key_fbr = K("fbr")
             if st.session_state.get(key_fyr) == "被胡" and st.session_state.get(key_fbr) == "被胡":
@@ -1348,85 +727,94 @@ def main():
                             fbt = st.selectbox("被谁?", [p for p in players if p != fbw], key=K("fbt"))
 
         with st.container(border=True):
-            ui_section("手牌常鸡", icon="🔢")
+            ui_section("常鸡录入 (非首出)", icon="🔢")
+            st.caption("⚠️ **录入规则**：听牌者录入【手牌+打出】总数；未听牌者仅录入【打出】数(包赔)。")
+
+            # V36: 极简单列录入
             extra_yj, extra_b8 = {}, {}
+
             cols_p = st.columns(4)
             for i, p in enumerate(players):
                 with cols_p[i]:
                     st.subheader(p)
-                    # ✅ 修复：添加 step=1 找回加减按钮
-                    extra_yj[p] = st.number_input(f"🦆({p})", 0, 4, 0, step=1, key=K(f"ey_{i}"))
-                    extra_b8[p] = st.number_input(f"🎱({p})", 0, 4, 0, step=1, key=K(f"eb_{i}"))
+                    extra_yj[p] = st.number_input(f"🦆 非首出 ({p})", 0, 4, 0, key=K(f"ey_{i}"))
+                    extra_b8[p] = st.number_input(f"🎱 非首出 ({p})", 0, 4, 0, key=K(f"eb_{i}"))
 
-        # Fan & Gang
-        c_fan, c_gang = st.columns([1, 1.5])
-        with c_fan:
-            with st.container(border=True):
-                ui_section("翻鸡", icon="🖐️")
-                hand_total_counts = {}
-                if fan_card in ["9条", "7筒"]:
-                    st.info("翻倍鸡不互斥")
-                else:
-                    for i, p in enumerate(players):
+        # Fan Chicken (Moved out of nested columns)
+        with st.container(border=True):
+            ui_section("翻鸡", icon="🖐️")
+            hand_total_counts = {}
+            if fan_card in ["9条", "7筒"]:
+                st.info("翻倍鸡不互斥")
+            else:
+                c_f1, c_f2, c_f3, c_f4 = st.columns(4)
+                cols_fan = [c_f1, c_f2, c_f3, c_f4]
+                for i, p in enumerate(players):
+                    with cols_fan[i]:
                         hand_total_counts[p] = st.number_input(f"{p}数", 0, 4, 0, key=K(f"fc_{i}"))
-        with c_gang:
-            with st.container(border=True):
-                ui_section("杠牌登记", icon="🛠️")
-                gang_data = []
 
-                if fyw != "无/未现" and fyr == "被明杠" and fyt:
-                    gang_data.append({'doer': fyt, 'type': '责任明杠', 'card': '幺鸡', 'victim': fyw})
-                    st.caption(f"ℹ️ 自动添加: {fyt} 责任明杠 {fyw} (幺鸡)")
-                if fbw != "无/未现" and fbr == "被明杠" and fbt:
-                    gang_data.append({'doer': fbt, 'type': '责任明杠', 'card': '八筒', 'victim': fbw})
-                    st.caption(f"ℹ️ 自动添加: {fbt} 责任明杠 {fbw} (八筒)")
+        # Gang Recording (Moved out of nested columns)
+        with st.container(border=True):
+            ui_section("杠牌登记", icon="🛠️")
+            gang_data = []
 
-                for i in range(st.session_state.gang_rows):
-                    c_g1, c_g2, c_g3, c_g4 = st.columns([1.2, 1, 1, 1.2])
-                    gw = c_g1.selectbox("杠主", ["无"] + players, key=K(f"gw{i}"), label_visibility="collapsed",
-                                        placeholder="杠主")
-                    if gw != "无":
-                        gt = c_g2.selectbox("类型", ["暗杠", "补杠", "普通明杠"], key=K(f"gt{i}"),
-                                            label_visibility="collapsed")
+            if fyw != "无/未现" and fyr == "被明杠" and fyt:
+                gang_data.append({'doer': fyt, 'type': '责任明杠', 'card': '幺鸡', 'victim': fyw})
+                st.caption(f"ℹ️ 自动添加: {fyt} 责任明杠 {fyw} (幺鸡)")
+            if fbw != "无/未现" and fbr == "被明杠" and fbt:
+                gang_data.append({'doer': fbt, 'type': '责任明杠', 'card': '八筒', 'victim': fbw})
+                st.caption(f"ℹ️ 自动添加: {fbt} 责任明杠 {fbw} (八筒)")
+
+            for i in range(st.session_state.gang_rows):
+                c_g1, c_g2, c_g3, c_g4 = st.columns([1.2, 1, 1, 1.2])
+                with c_g1:
+                    gw = st.selectbox("杠主", ["无"] + players, key=K(f"gw{i}"), label_visibility="collapsed",
+                                      placeholder="杠主")
+                if gw != "无":
+                    with c_g2:
+                        gt = st.selectbox("类型", ["暗杠", "补杠", "普通明杠"], key=K(f"gt{i}"),
+                                          label_visibility="collapsed")
+                    with c_g3:
                         if gt == "补杠":
-                            gc = c_g3.selectbox("牌种", ["杂牌"], key=K(f"gc{i}"), label_visibility="collapsed",
-                                                disabled=True)
+                            gc = st.selectbox("牌种", ["杂牌"], key=K(f"gc{i}"), label_visibility="collapsed",
+                                              disabled=True)
                         else:
-                            gc = c_g3.selectbox("牌种", ["杂牌", "幺鸡", "八筒"], key=K(f"gc{i}"),
-                                                label_visibility="collapsed")
+                            gc = st.selectbox("牌种", ["杂牌", "幺鸡", "八筒"], key=K(f"gc{i}"),
+                                              label_visibility="collapsed")
+                    with c_g4:
                         gv = None
                         if gt == "普通明杠":
-                            gv = c_g4.selectbox("被杠者", [p for p in players if p != gw], key=K(f"gv{i}"),
-                                                label_visibility="collapsed", placeholder="被杠者")
-                        gang_data.append({'doer': gw, 'type': gt, 'card': gc, 'victim': gv})
+                            gv = st.selectbox("被杠者", [p for p in players if p != gw], key=K(f"gv{i}"),
+                                              label_visibility="collapsed", placeholder="被杠者")
+                    gang_data.append({'doer': gw, 'type': gt, 'card': gc, 'victim': gv})
 
-                if fyw != "无/未现" and fyr == "被碰" and fyt:
-                    yj_bu = st.checkbox(f"幺鸡被碰后补杠（补杠者：{fyt}）", value=False, key=K("yj_bu_gang"))
-                    if yj_bu:
-                        exists = False
-                        for g in gang_data:
-                            if g.get('type') == '补杠' and g.get('card') == '幺鸡' and g.get('doer') == fyt:
-                                exists = True
-                                break
-                        if not exists:
-                            gang_data.append({'doer': fyt, 'type': '补杠', 'card': '幺鸡', 'victim': None})
-                            st.caption(f"ℹ️ 自动添加: {fyt} 补杠 (幺鸡)")
+            if fyw != "无/未现" and fyr == "被碰" and fyt:
+                yj_bu = st.checkbox(f"幺鸡被碰后补杠（补杠者：{fyt}）", value=False, key=K("yj_bu_gang"))
+                if yj_bu:
+                    exists = False
+                    for g in gang_data:
+                        if g.get('type') == '补杠' and g.get('card') == '幺鸡' and g.get('doer') == fyt:
+                            exists = True
+                            break
+                    if not exists:
+                        gang_data.append({'doer': fyt, 'type': '补杠', 'card': '幺鸡', 'victim': None})
+                        st.caption(f"ℹ️ 自动添加: {fyt} 补杠 (幺鸡)")
 
-                if fbw != "无/未现" and fbr == "被碰" and fbt:
-                    b8_bu = st.checkbox(f"八筒被碰后补杠（补杠者：{fbt}）", value=False, key=K("b8_bu_gang"))
-                    if b8_bu:
-                        exists = False
-                        for g in gang_data:
-                            if g.get('type') == '补杠' and g.get('card') == '八筒' and g.get('doer') == fbt:
-                                exists = True
-                                break
-                        if not exists:
-                            gang_data.append({'doer': fbt, 'type': '补杠', 'card': '八筒', 'victim': None})
-                            st.caption(f"ℹ️ 自动添加: {fbt} 补杠 (八筒)")
+            if fbw != "无/未现" and fbr == "被碰" and fbt:
+                b8_bu = st.checkbox(f"八筒被碰后补杠（补杠者：{fbt}）", value=False, key=K("b8_bu_gang"))
+                if b8_bu:
+                    exists = False
+                    for g in gang_data:
+                        if g.get('type') == '补杠' and g.get('card') == '八筒' and g.get('doer') == fbt:
+                            exists = True
+                            break
+                    if not exists:
+                        gang_data.append({'doer': fbt, 'type': '补杠', 'card': '八筒', 'victim': None})
+                        st.caption(f"ℹ️ 自动添加: {fbt} 补杠 (八筒)")
 
-                if st.button("➕ 添加", key=K("add_gang")):
-                    st.session_state.gang_rows += 1
-                    st.rerun()
+            if st.button("➕ 添加", key=K("add_gang")):
+                st.session_state.gang_rows += 1
+                st.rerun()
 
     # --- Right column: sticky action bar + summary + results ---
     with right:
@@ -1489,7 +877,7 @@ def main():
                 st.stop()
 
             try:
-                scores, details = calculate_all(
+                scores, details = calculate_all_pipeline(
                     players=players,
                     winners=winners,
                     method=method,
@@ -1502,8 +890,7 @@ def main():
                     ready_list=ready_list,
                     first_yj_who=fyw, first_yj_res=fyr, first_yj_tar=fyt,
                     first_b8_who=fbw, first_b8_res=fbr, first_b8_tar=fbt,
-                    extra_yj=extra_yj,
-                    extra_b8=extra_b8,
+                    extra_yj=extra_yj, extra_b8=extra_b8,
                     hand_total_counts=hand_total_counts,
                     gang_data=gang_data,
                     common_v=common_v,
